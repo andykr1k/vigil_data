@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "filter_method": "ekf",
+  "tuning": {
+    "position_measurement_noise_meters": 0.008,
+    "acceleration_noise_meters_per_second2": 3.0,
+    "rotation_measurement_noise_degrees": 2.3,
+    "angular_acceleration_noise_degrees_per_second2": 180.0,
+    "position_min_cutoff_hz": 1.0,
+    "position_beta": 0.03,
+    "rotation_min_cutoff_hz": 1.0,
+    "rotation_beta": 0.03,
+    "derivative_cutoff_hz": 1.0
+  }
+}

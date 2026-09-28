@@ -1,0 +1,970 @@
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+import { CSS2DRenderer, CSS2DObject } from "three/addons/renderers/CSS2DRenderer.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+// Binary messages: u8 kind, u8 camera, 2 pad, u32 seq (must match pipeline.py).
+const MSG_MESH = 1, MSG_JPEG = 2, MSG_CLOUD = 3;
+
+const COLORS = {
+  left: new THREE.Color("#22e4ff"),
+  right: new THREE.Color("#ff3df2"),
+  center: new THREE.Color("#8fa8ff"),
+  upper: new THREE.Color("#4d6a9a"),
+  mesh: new THREE.Color("#3fd8ff"),
+  grid: new THREE.Color("#1fb6ff"),
+  tip: new THREE.Color("#ff2a2a"),
+  gold: new THREE.Color("#ffd23d"),
+};
+const SEGMENT_LABELS = { thigh: "THIGH", shin: "SHIN", foot: "FOOT" };
+
+// ───────────────────────────── settings ─────────────────────────────
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("vigil." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("vigil." + k, JSON.stringify(v)); } catch { /* ignore */ } },
+};
+const opts = {};
+document.querySelectorAll("[data-toggle]").forEach((el) => {
+  const key = el.dataset.toggle;
+  el.checked = store.get("t." + key, el.checked);
+  opts[key] = el.checked;
+  el.addEventListener("change", () => { opts[key] = el.checked; store.set("t." + key, el.checked); applyVisibility(); });
+});
+document.querySelectorAll(".panel.collapsible").forEach((p) => {
+  if (store.get("c." + p.id, false)) p.classList.add("collapsed");
+  p.querySelector("header").addEventListener("click", () => {
+    p.classList.toggle("collapsed");
+    store.set("c." + p.id, p.classList.contains("collapsed"));
+  });
+});
+
+// ───────────────────────────── renderer ─────────────────────────────
+const stage = document.getElementById("stage");
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+stage.appendChild(renderer.domElement);
+
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(innerWidth, innerHeight);
+labelRenderer.domElement.className = "labels";
+stage.appendChild(labelRenderer.domElement);
+
+const BACKGROUND = new THREE.Color("#02050a");
+const scene = new THREE.Scene();
+scene.background = BACKGROUND;
+scene.fog = new THREE.FogExp2("#02050a", 0.075);
+
+// Only the probe model needs lighting; everything else is emissive.
+scene.add(new THREE.HemisphereLight("#bfe9ff", "#0a1420", 1.4));
+const keyLight = new THREE.DirectionalLight("#ffffff", 1.6);
+keyLight.position.set(2, 4, 3);
+scene.add(keyLight);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.02, 200);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.autoRotateSpeed = 0.6;
+controls.maxPolarAngle = Math.PI * 0.495;
+
+// Selective bloom: only objects on BLOOM_LAYER glow, so tags, the probe model and the
+// point cloud stay crisp. Non-glowing objects are rendered black into the bloom buffer.
+const BLOOM_LAYER = 1;
+const bloomLayer = new THREE.Layers();
+bloomLayer.set(BLOOM_LAYER);
+const glow = (obj) => { obj.traverse((o) => o.layers.enable(BLOOM_LAYER)); return obj; };
+
+const bloomComposer = new EffectComposer(renderer);
+bloomComposer.renderToScreen = false;
+bloomComposer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.9, 0.5, 0.05);
+bloomComposer.addPass(bloom);
+
+const mixPass = new ShaderPass(new THREE.ShaderMaterial({
+  uniforms: { baseTexture: { value: null }, bloomTexture: { value: bloomComposer.renderTarget2.texture }, uStrength: { value: 1 } },
+  vertexShader: /* glsl */ `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D baseTexture; uniform sampler2D bloomTexture; uniform float uStrength; varying vec2 vUv;
+    void main() { gl_FragColor = texture2D(baseTexture, vUv) + uStrength * texture2D(bloomTexture, vUv); }`,
+}), "baseTexture");
+mixPass.needsSwap = true;
+const finalComposer = new EffectComposer(renderer);
+finalComposer.addPass(new RenderPass(scene, camera));
+finalComposer.addPass(mixPass);
+finalComposer.addPass(new OutputPass());
+
+const darkMaterials = {
+  mesh: new THREE.MeshBasicMaterial({ color: 0x000000 }),
+  points: new THREE.PointsMaterial({ color: 0x000000, size: 0.014 }),
+  line: new THREE.LineBasicMaterial({ color: 0x000000 }),
+};
+const savedMaterials = new Map();
+function darkenNonBloomed(obj) {
+  if (!obj.material || bloomLayer.test(obj.layers)) return;
+  savedMaterials.set(obj, obj.material);
+  obj.material = obj.isPoints ? darkMaterials.points : obj.isLine ? darkMaterials.line : darkMaterials.mesh;
+}
+function restoreMaterial(obj) {
+  const m = savedMaterials.get(obj);
+  if (m) { obj.material = m; savedMaterials.delete(obj); }
+}
+function render() {
+  if (opts.bloom) {
+    scene.background = null;
+    scene.traverse(darkenNonBloomed);
+    bloomComposer.render();
+    scene.traverse(restoreMaterial);
+    scene.background = BACKGROUND;
+  }
+  mixPass.uniforms.uStrength.value = opts.bloom ? 1 : 0;
+  finalComposer.render();
+}
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  bloomComposer.setSize(innerWidth, innerHeight);
+  finalComposer.setSize(innerWidth, innerHeight);
+  labelRenderer.setSize(innerWidth, innerHeight);
+});
+
+// ───────────────────────────── world frames ─────────────────────────────
+// worldRoot: levels the scene using the floor plane (y = 0 is the floor).
+// sensorRoot: world = first camera's optical frame (x right, y down, z forward)
+//             → three.js (x right, y up, z back). Per-camera groups hang off it.
+const worldRoot = new THREE.Group();
+scene.add(worldRoot);
+const sensorRoot = new THREE.Group();
+sensorRoot.rotation.x = Math.PI;
+worldRoot.add(sensorRoot);
+const levelTarget = { quat: new THREE.Quaternion(), height: 1.2, known: false };
+worldRoot.position.y = levelTarget.height;
+
+// ───────────────────────────── environment ─────────────────────────────
+const floorMat = new THREE.ShaderMaterial({
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+  uniforms: { uColor: { value: COLORS.grid }, uFocus: { value: new THREE.Vector2(0, -2.5) } },
+  vertexShader: /* glsl */ `
+    varying vec3 vWorld;
+    void main() {
+      vec4 w = modelMatrix * vec4(position, 1.0);
+      vWorld = w.xyz;
+      gl_Position = projectionMatrix * viewMatrix * w;
+    }`,
+  fragmentShader: /* glsl */ `
+    uniform vec3 uColor; uniform vec2 uFocus;
+    varying vec3 vWorld;
+    float grid(vec2 p, float s, float w) {
+      vec2 q = p / s;
+      vec2 g = abs(fract(q - 0.5) - 0.5) / (fwidth(q) * w);
+      return 1.0 - min(min(g.x, g.y), 1.0);
+    }
+    void main() {
+      vec2 p = vWorld.xz;
+      float d = length(p - uFocus);
+      float fade = exp(-d * 0.22);
+      float g = grid(p, 0.25, 1.0) * 0.22 + grid(p, 1.0, 1.4) * 0.75;
+      float glow = exp(-d * d * 3.5) * 0.3;
+      float a = g * fade + glow;
+      gl_FragColor = vec4(uColor * a, a);
+    }`,
+});
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(80, 80), floorMat); // additive already; no bloom
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+
+const dust = (() => {
+  const n = 1800, pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    pos[i * 3] = (Math.random() - 0.5) * 40;
+    pos[i * 3 + 1] = Math.random() * 12;
+    pos[i * 3 + 2] = (Math.random() - 0.5) * 40;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  return new THREE.Points(g, new THREE.PointsMaterial({
+    size: 0.03, color: "#3a6d9a", transparent: true, opacity: 0.6, depthWrite: false,
+  }));
+})();
+scene.add(dust);
+
+// ───────────────────────────── cameras (rig) ─────────────────────────────
+const CLOUD_MAX = 200_000;
+let rigCams = []; // per camera: { info, group, cloudGeo, feed, image }
+
+function makeSensorGlyph(cam, highlight) {
+  const g = new THREE.Group();
+  const d = 0.35, w = cam.width, h = cam.height;
+  const corners = [[0, 0], [w, 0], [w, h], [0, h]].map(([u, v]) =>
+    new THREE.Vector3(((u - cam.cx) / cam.fx) * d, ((v - cam.cy) / cam.fy) * d, d));
+  const pts = [];
+  corners.forEach((c, i) => { pts.push(new THREE.Vector3(), c, c, corners[(i + 1) % 4]); });
+  g.add(glow(new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: highlight ? "#22e4ff" : "#7d8cff", transparent: true, opacity: 0.55 }))));
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.025, 0.025), new THREE.MeshBasicMaterial({ color: "#0f3550" }));
+  body.position.z = -0.013;
+  g.add(body, glow(new THREE.Mesh(new THREE.SphereGeometry(0.006, 12, 12), new THREE.MeshBasicMaterial({ color: "#8ff4ff" }))));
+  const el = document.createElement("div");
+  el.className = "tag";
+  el.style.color = highlight ? "#22e4ff" : "#7d8cff";
+  el.textContent = `CAM ${cam.index + 1}`;
+  const label = new CSS2DObject(el);
+  label.position.set(0, -0.05, 0);
+  g.add(label);
+  return g;
+}
+
+function buildRig(cameras) {
+  for (const rc of rigCams) sensorRoot.remove(rc.group);
+  const feeds = $("feeds");
+  feeds.innerHTML = "";
+  rigCams = cameras.map((cam) => {
+    const group = new THREE.Group();
+    group.matrixAutoUpdate = false;
+    if (cam.T_world_camera) group.matrix.set(...cam.T_world_camera);
+    group.visible = !!cam.T_world_camera;
+    group.add(makeSensorGlyph(cam, cam.index === 0));
+
+    const cloudGeo = new THREE.BufferGeometry();
+    cloudGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(CLOUD_MAX * 3), 3).setUsage(THREE.DynamicDrawUsage));
+    cloudGeo.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(CLOUD_MAX * 3), 3, true).setUsage(THREE.DynamicDrawUsage));
+    cloudGeo.setDrawRange(0, 0);
+    const cloud = new THREE.Points(cloudGeo, new THREE.PointsMaterial({
+      size: 0.014, vertexColors: true, transparent: true, opacity: 0.8, depthWrite: false,
+      color: new THREE.Color(0.32, 0.4, 0.48), // keep real colours muted behind the subject
+    }));
+    cloud.frustumCulled = false;
+    cloud.visible = opts.cloud;
+    group.add(cloud);
+    sensorRoot.add(group);
+
+    const wrap = document.createElement("div");
+    wrap.innerHTML = `<div class="feed-head"><span><b>CAM ${cam.index + 1}</b> …${cam.serial.slice(-4)}</span>` +
+      `<span>${cam.width}×${cam.height}@${cam.fps}</span></div><canvas></canvas>`;
+    feeds.appendChild(wrap);
+    const feed = wrap.querySelector("canvas");
+    feed.style.aspectRatio = `${cam.width} / ${cam.height}`;
+    return { info: cam, group, cloud, cloudGeo, feed, ctx: feed.getContext("2d"), image: null };
+  });
+  renderRigList();
+}
+
+function onCloud(cam, buf) {
+  const rc = rigCams[cam];
+  if (!rc) return;
+  const n = Math.min(new DataView(buf).getUint32(8, true), CLOUD_MAX);
+  const xyz = new Int16Array(buf, 12, n * 3);
+  const rgb = new Uint8Array(buf, 12 + n * 6, n * 3);
+  const pos = rc.cloudGeo.attributes.position.array, col = rc.cloudGeo.attributes.color.array;
+  for (let i = 0; i < n * 3; i++) pos[i] = xyz[i] * 0.001;
+  col.set(rgb);
+  rc.cloudGeo.attributes.position.needsUpdate = true;
+  rc.cloudGeo.attributes.color.needsUpdate = true;
+  rc.cloudGeo.setDrawRange(0, n);
+}
+
+// ───────────────────────────── hologram mesh ─────────────────────────────
+const holoMat = new THREE.ShaderMaterial({
+  transparent: true,
+  depthWrite: false,
+  side: THREE.DoubleSide,
+  blending: THREE.AdditiveBlending,
+  uniforms: { uColor: { value: COLORS.mesh }, uTime: { value: 0 }, uOpacity: { value: 0 } },
+  vertexShader: /* glsl */ `
+    varying vec3 vN; varying vec3 vV; varying float vY;
+    void main() {
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      vN = normalize(normalMatrix * normal);
+      vV = normalize(-mv.xyz);
+      vY = (modelMatrix * vec4(position, 1.0)).y;
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: /* glsl */ `
+    uniform vec3 uColor; uniform float uTime; uniform float uOpacity;
+    varying vec3 vN; varying vec3 vV; varying float vY;
+    void main() {
+      float f = pow(1.0 - abs(dot(normalize(vN), normalize(vV))), 2.4);
+      float scan = smoothstep(0.44, 0.5, abs(fract(vY * 22.0 - uTime * 0.9) - 0.5));
+      float sweep = exp(-pow((fract(uTime * 0.25) * 2.4 - vY) * 8.0, 2.0));
+      float legs = smoothstep(1.1, 0.7, vY);   // brighter below the hips
+      float a = (0.035 + f * 0.75 + scan * 0.10 + sweep * 0.25) * (0.55 + 0.45 * legs) * uOpacity;
+      gl_FragColor = vec4(uColor * (0.5 + f * 1.5 + sweep), a);
+    }`,
+});
+const meshGeo = new THREE.BufferGeometry();
+const holo = glow(new THREE.Mesh(meshGeo, holoMat));
+holo.frustumCulled = false;
+holo.visible = false;
+sensorRoot.add(holo);
+let meshReady = false;
+let lastMeshAt = 0;
+
+async function loadFaces() {
+  const r = await fetch("/api/mesh/faces");
+  if (!r.ok) return;
+  meshGeo.setIndex(new THREE.BufferAttribute(new Uint32Array(await r.arrayBuffer()), 1));
+  meshReady = true;
+}
+
+function onMesh(buf) {
+  if (!meshReady) return;
+  const n = new DataView(buf).getUint32(8, true);
+  const src = new Int16Array(buf, 12, n * 3);
+  let attr = meshGeo.attributes.position;
+  if (!attr || attr.count !== n) {
+    attr = new THREE.BufferAttribute(new Float32Array(n * 3), 3).setUsage(THREE.DynamicDrawUsage);
+    meshGeo.setAttribute("position", attr);
+  }
+  for (let i = 0; i < n * 3; i++) attr.array[i] = src[i] * 0.001;
+  attr.needsUpdate = true;
+  meshGeo.computeVertexNormals();
+  lastMeshAt = performance.now();
+}
+
+// ───────────────────────────── skeleton ─────────────────────────────
+let skel = null; // built on hello
+
+function sideOf(name) {
+  if (name.startsWith("left_")) return "left";
+  if (name.startsWith("right_")) return "right";
+  return "center";
+}
+
+function buildSkeleton(hello) {
+  if (skel) sensorRoot.remove(skel.group);
+  const group = new THREE.Group();
+  const legSet = new Set(hello.leg_joints);
+  const joints = {};
+  const sphere = new THREE.SphereGeometry(1, 20, 14);
+  for (const name of hello.joints) {
+    const leg = legSet.has(name);
+    const color = leg ? COLORS[sideOf(name)] : COLORS.upper;
+    const m = new THREE.Mesh(sphere, new THREE.MeshBasicMaterial({ color, transparent: true }));
+    m.scale.setScalar(leg ? (name.includes("toe") || name.includes("heel") ? 0.014 : 0.024) : 0.016);
+    m.userData = { leg, name };
+    m.visible = false;
+    const halo = new THREE.Mesh(sphere, new THREE.MeshBasicMaterial({
+      color, transparent: true, opacity: 0.12, depthWrite: false, blending: THREE.AdditiveBlending }));
+    halo.scale.setScalar(2.2);
+    m.add(halo);
+    group.add(m);
+    joints[name] = m;
+  }
+  const cyl = new THREE.CylinderGeometry(1, 1, 1, 10, 1, true);
+  const bones = hello.bones.map(([a, b]) => {
+    const leg = legSet.has(a) && legSet.has(b) && !(a === "pelvis" && b === "neck");
+    const s = sideOf(b) === "center" ? sideOf(a) : sideOf(b);
+    const color = leg ? COLORS[s] : COLORS.upper;
+    const m = new THREE.Mesh(cyl, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: leg ? 0.95 : 0.55 }));
+    m.userData = { a, b, leg, radius: leg ? 0.009 : 0.005 };
+    m.visible = false;
+    group.add(m);
+    return m;
+  });
+
+  const tags = {};
+  for (const side of ["left", "right"]) {
+    for (const j of ["hip", "knee", "ankle"]) {
+      const el = document.createElement("div");
+      el.className = "tag";
+      el.style.color = side === "left" ? "#22e4ff" : "#ff3df2";
+      const obj = new CSS2DObject(el);
+      // CSS2DRenderer owns the element's transform; offset the tag via its anchor instead.
+      obj.center.set(side === "left" ? -0.2 : 1.2, 0.5);
+      joints[`${side}_${j}`].add(obj);
+      tags[`${side}_${j}`] = { el, obj };
+    }
+  }
+  glow(group);
+  sensorRoot.add(group);
+  skel = { group, joints, bones, tags };
+}
+
+const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _up = new THREE.Vector3(0, 1, 0);
+function updateSkeleton(person) {
+  if (!skel) return;
+  const J = person ? person.joints : {};
+  for (const [name, m] of Object.entries(skel.joints)) {
+    const j = J[name];
+    m.visible = !!j && opts.skeleton && (m.userData.leg || opts.upper);
+    if (j) {
+      m.position.set(j[0], j[1], j[2]);
+      m.material.opacity = j[3] < 0.5 ? 0.35 : 1.0;
+    }
+  }
+  for (const m of skel.bones) {
+    const ja = J[m.userData.a], jb = J[m.userData.b];
+    const show = !!(ja && jb) && opts.skeleton && (m.userData.leg || opts.upper);
+    m.visible = show;
+    if (!show) continue;
+    _a.set(ja[0], ja[1], ja[2]);
+    _b.set(jb[0], jb[1], jb[2]);
+    const len = _a.distanceTo(_b);
+    m.position.copy(_a).add(_b).multiplyScalar(0.5);
+    m.quaternion.setFromUnitVectors(_up, _b.sub(_a).normalize());
+    m.scale.set(m.userData.radius, len, m.userData.radius);
+  }
+  const angles = person ? person.angles : {};
+  for (const [key, t] of Object.entries(skel.tags)) {
+    const v = angles[key];
+    t.obj.visible = opts.labels && v != null && skel.joints[key].visible;
+    if (v != null) t.el.innerHTML = `<small>${key.split("_")[1].toUpperCase()}</small>${v.toFixed(0)}°`;
+  }
+}
+
+// ───────────────────────────── trails ─────────────────────────────
+function makeTrail(color, n, width = 1) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(n * 3), 3).setUsage(THREE.DynamicDrawUsage));
+  const c = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const k = Math.pow(i / (n - 1), 1.6);
+    c[i * 3] = color.r * k; c[i * 3 + 1] = color.g * k; c[i * 3 + 2] = color.b * k;
+  }
+  g.setAttribute("color", new THREE.BufferAttribute(c, 3));
+  g.setDrawRange(0, 0);
+  const line = glow(new THREE.Line(g, new THREE.LineBasicMaterial({
+    vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, linewidth: width })));
+  line.frustumCulled = false;
+  sensorRoot.add(line);
+  const trail = {
+    line, n, count: 0,
+    push(p) {
+      const a = g.attributes.position.array;
+      a.copyWithin(0, 3);
+      a.set(p, (n - 1) * 3);
+      trail.count = Math.min(trail.count + 1, n);
+      g.setDrawRange(n - trail.count, trail.count); // only the filled tail of the buffer
+      g.attributes.position.needsUpdate = true;
+    },
+    clear() { trail.count = 0; g.setDrawRange(0, 0); },
+  };
+  return trail;
+}
+const footTrails = { left: makeTrail(COLORS.left, 90), right: makeTrail(COLORS.right, 90) };
+function updateFootTrails(person) {
+  for (const side of ["left", "right"]) {
+    const J = person?.joints ?? {};
+    const j = J[`${side}_heel`] ?? J[`${side}_ankle`];
+    if (j) footTrails[side].push([j[0], j[1], j[2]]);
+  }
+}
+
+// ───────────────────────────── probe ─────────────────────────────
+// probeGroup's matrix is the cube pose (object → world); children live in the cube frame.
+const probeGroup = new THREE.Group();
+probeGroup.matrixAutoUpdate = false;
+probeGroup.visible = false;
+sensorRoot.add(probeGroup);
+const tipTrail = makeTrail(COLORS.tip, 240);
+const probeState = { info: null, lastSeen: 0, tipLabel: null, method: null };
+
+const nearestLine = glow(new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+  new THREE.LineDashedMaterial({ color: COLORS.gold, dashSize: 0.01, gapSize: 0.006, transparent: true, opacity: 0.9 })));
+nearestLine.frustumCulled = false;
+nearestLine.visible = false;
+sensorRoot.add(nearestLine);
+
+function buildProbe(info) {
+  probeGroup.clear();
+  probeState.info = info;
+  if (!info) return;
+
+  new GLTFLoader().load(info.model_url, (gltf) => {
+    const model = gltf.scene;
+    model.traverse((o) => {
+      if (!o.isMesh) return;
+      o.geometry.computeVertexNormals(); // exported without normals
+      o.material = new THREE.MeshStandardMaterial({
+        color: "#9fb0c2", metalness: 0.35, roughness: 0.42, side: THREE.DoubleSide,
+        polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+      });
+      // Faint cyan edges read as "tracked object" and survive the dark scene.
+      const edges = glow(new THREE.LineSegments(new THREE.EdgesGeometry(o.geometry, 35),
+        new THREE.LineBasicMaterial({ color: "#22e4ff", transparent: true, opacity: 0.35 })));
+      o.add(edges);
+    });
+    probeGroup.add(model);
+  }, undefined, (err) => console.warn("probe model failed to load", err));
+
+  // ArUco tags on their cube faces (texture includes the printed white margin).
+  const loader = new THREE.TextureLoader();
+  for (const m of info.mounts) {
+    const tex = loader.load(info.tag_url.replace("{id}", m.id));
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.magFilter = THREE.NearestFilter; // keep the code cells sharp
+    const plane = new THREE.Mesh(new THREE.PlaneGeometry(info.tag_size, info.tag_size),
+      new THREE.MeshBasicMaterial({ map: tex, color: new THREE.Color(0.78, 0.78, 0.78), polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+    const x = new THREE.Vector3(...m.x_axis), y = new THREE.Vector3(...m.y_axis);
+    const z = new THREE.Vector3().crossVectors(x, y);
+    plane.matrix.makeBasis(x, y, z).setPosition(new THREE.Vector3(...m.center).addScaledVector(z, 0.0004));
+    plane.matrixAutoUpdate = false;
+    plane.userData.markerId = m.id;
+    probeGroup.add(plane);
+  }
+
+  // The tip: a red dot with a halo and a label.
+  const tip = new THREE.Group();
+  tip.position.set(...info.tip);
+  tip.add(glow(new THREE.Mesh(new THREE.SphereGeometry(0.0045, 20, 14), new THREE.MeshBasicMaterial({ color: COLORS.tip }))));
+  tip.add(glow(new THREE.Mesh(new THREE.SphereGeometry(0.011, 20, 14), new THREE.MeshBasicMaterial({
+    color: COLORS.tip, transparent: true, opacity: 0.18, depthWrite: false, blending: THREE.AdditiveBlending }))));
+  const el = document.createElement("div");
+  el.className = "tag";
+  el.style.color = "#ff5a5a";
+  const label = new CSS2DObject(el);
+  label.center.set(-0.15, 0.5);
+  tip.add(label);
+  probeState.tipLabel = { el, obj: label };
+  probeGroup.add(tip);
+
+  // Cube axes, as in DataCollection's viewer (X red, Y green, Z blue).
+  probeGroup.add(new THREE.AxesHelper(0.06));
+  setProbeMethod(info.method);
+}
+
+const _m4 = new THREE.Matrix4();
+function updateProbe(probe) {
+  const panel = $("probe-state");
+  if (!probe) {
+    panel.textContent = probeState.info ? "NO DATA" : "DISABLED";
+    return;
+  }
+  setProbeMethod(probe.method);
+  const now = performance.now();
+  const chips = new Set(probe.tracked ? probe.marker_ids : []);
+  document.querySelectorAll("#tag-chips span").forEach((s) => s.classList.toggle("on", chips.has(+s.dataset.tag)));
+  $("probe-cams").textContent = probe.tracked ? `${probe.cameras} CAM${probe.cameras === 1 ? "" : "S"}` : "";
+  panel.textContent = probe.tracked ? "TRACKED" : "SEARCHING";
+  panel.style.color = probe.tracked ? "var(--ok)" : "var(--warn)";
+
+  if (!probe.tracked) {
+    nearestLine.visible = false;
+    return;
+  }
+  probeState.lastSeen = now;
+  const [r0, r1, r2, r3, r4, r5, r6, r7, r8] = probe.rotation;
+  const [px, py, pz] = probe.position;
+  _m4.set(r0, r1, r2, px, r3, r4, r5, py, r6, r7, r8, pz, 0, 0, 0, 1);
+  probeGroup.matrix.copy(_m4);
+  probeGroup.matrixWorldNeedsUpdate = true;
+  tipTrail.push(probe.tip);
+
+  // Tip in the levelled scene frame: y is height above the floor.
+  const tipScene = sensorRoot.localToWorld(new THREE.Vector3(...probe.tip));
+  $("tip-x").textContent = (tipScene.x * 1000).toFixed(0);
+  $("tip-y").textContent = (tipScene.y * 1000).toFixed(0);
+  $("tip-z").textContent = (tipScene.z * 1000).toFixed(0);
+
+  const near = probe.nearest;
+  if (near) {
+    const [side, seg] = near.segment.split("_");
+    $("nearest-seg").textContent = `${side.toUpperCase()} ${SEGMENT_LABELS[seg]}`;
+    $("nearest-seg").style.color = side === "left" ? "#22e4ff" : "#ff3df2";
+    $("nearest-dist").textContent = `${near.distance_mm.toFixed(0)} mm`;
+    const pos = nearestLine.geometry.attributes.position;
+    pos.setXYZ(0, ...probe.tip);
+    pos.setXYZ(1, ...near.point);
+    pos.needsUpdate = true;
+    nearestLine.computeLineDistances();
+    nearestLine.visible = opts.probe && opts.skeleton;
+  } else {
+    $("nearest-seg").textContent = "—";
+    $("nearest-dist").textContent = "—";
+    nearestLine.visible = false;
+  }
+  if (probeState.tipLabel) {
+    probeState.tipLabel.el.innerHTML = near
+      ? `<small>TIP</small>${near.distance_mm.toFixed(0)} mm · ${near.segment.replace("_", " ").toUpperCase()}`
+      : "<small>TIP</small>";
+  }
+}
+
+function setProbeMethod(method) {
+  if (method === probeState.method) return;
+  probeState.method = method;
+  document.querySelectorAll("#probe-filter button").forEach((b) => b.classList.toggle("on", b.dataset.method === method));
+}
+document.querySelectorAll("#probe-filter button").forEach((b) => {
+  b.onclick = () => send({ cmd: "probe_filter", method: b.dataset.method });
+});
+$("probe-reset").onclick = () => { send({ cmd: "probe_reset" }); tipTrail.clear(); };
+
+// ───────────────────────────── scene levelling ─────────────────────────────
+const _n = new THREE.Vector3();
+function updateLevel(frame) {
+  if (frame.floor) {
+    const [nx, ny, nz] = frame.floor.normal;
+    _n.set(nx, -ny, -nz).normalize(); // optical frame → sensorRoot parent frame
+    levelTarget.quat.setFromUnitVectors(_n, _up);
+    levelTarget.height = frame.floor.height;
+    levelTarget.known = true;
+  } else if (frame.person && !levelTarget.known) {
+    // No plane from depth: put the floor under the lowest foot point.
+    const J = frame.person.joints;
+    let lowest = -Infinity;
+    for (const k of ["left_heel", "right_heel", "left_big_toe", "right_big_toe"]) if (J[k]) lowest = Math.max(lowest, J[k][1]);
+    if (lowest === -Infinity) for (const k of ["left_ankle", "right_ankle"]) if (J[k]) lowest = Math.max(lowest, J[k][1] + 0.08);
+    if (lowest > -Infinity) levelTarget.height += (lowest - levelTarget.height) * 0.05;
+  }
+}
+
+// ───────────────────────────── HUD ─────────────────────────────
+function $(id) { return document.getElementById(id); }
+const angleCells = [...document.querySelectorAll("[data-angle]")];
+const spark = $("spark"), sparkCtx = spark.getContext("2d");
+const history = [];
+let lastFrame = null, hello = null;
+
+function setStatus(state, message) {
+  const dot = $("status-dot");
+  dot.className = "dot " + ({ running: "ok", loading: "warn", starting: "warn", error: "err", offline: "err" }[state] ?? "");
+  $("status-state").textContent = { running: "ONLINE", loading: "BOOTING", starting: "BOOTING", error: "FAULT", offline: "NO LINK" }[state] ?? state.toUpperCase();
+  const msg = $("status-msg");
+  msg.textContent = message ?? "";
+  msg.classList.toggle("err", state === "error" || state === "offline");
+}
+
+function updateHud(frame) {
+  const fpsCell = (id, v) => {
+    $(id).textContent = v.toFixed(1);
+    $(id).style.color = v >= 29 ? "" : "var(--warn)"; // target is ≥30 fps
+  };
+  fpsCell("stat-fps", frame.fps);
+  fpsCell("stat-body-fps", frame.body_fps);
+  $("stat-latency").textContent = `${frame.latency_ms.toFixed(0)} ms`;
+  const age = frame.timings.detection_age_ms;
+  $("stat-detect").textContent = age == null ? "—" : `${age} ms`;
+  $("stat-pose").textContent = `${frame.timings.pose_ms.toFixed(0)} ms`;
+  $("stat-probe").textContent = `${frame.timings.probe_ms.toFixed(0)} ms`;
+  $("stat-people").textContent = frame.people;
+  const subj = $("subject-state");
+  subj.textContent = frame.person ? "SUBJECT LOCK" : "NO SUBJECT";
+  subj.classList.toggle("on", !!frame.person);
+
+  for (const v of frame.views) {
+    const stateEl = document.querySelector(`#rig-list li[data-cam="${v.cam}"] .state`);
+    if (stateEl) {
+      const reconnecting = v.state === "reconnecting";
+      stateEl.classList.toggle("err", reconnecting);
+      if (reconnecting) stateEl.textContent = "RECONNECTING";
+      else if (stateEl.textContent === "RECONNECTING") renderRigList();
+    }
+  }
+
+  const angles = frame.person?.angles ?? {};
+  for (const cell of angleCells) {
+    const v = angles[cell.dataset.angle];
+    cell.classList.toggle("none", v == null);
+    cell.querySelector("b").textContent = v == null ? "—" : v.toFixed(0);
+    cell.querySelector("i").style.width = v == null ? "0" : `${Math.min(Math.abs(v) / 150, 1) * 100}%`;
+  }
+  const now = performance.now() / 1000;
+  history.push([now, angles.left_knee ?? null, angles.right_knee ?? null]);
+  while (history.length && now - history[0][0] > 10) history.shift();
+  drawSpark(now);
+
+  if (frame.calibration) {
+    const { progress, target } = frame.calibration;
+    const others = rigCams.slice(1).map((rc) => progress[rc.info.serial] ?? 0);
+    const pct = others.length ? Math.min(...others) / target : 0;
+    $("cal-progress").hidden = false;
+    $("cal-progress").firstElementChild.style.width = `${Math.round(pct * 100)}%`;
+    rigMsg(`Collecting still views… ${rigCams.slice(1).map((rc) => `CAM ${rc.info.index + 1}: ${progress[rc.info.serial] ?? 0}/${target}`).join(" · ")}`);
+  }
+}
+
+function drawSpark(now) {
+  const w = spark.clientWidth, h = spark.clientHeight, dpr = devicePixelRatio;
+  if (spark.width !== w * dpr) { spark.width = w * dpr; spark.height = h * dpr; }
+  const c = sparkCtx;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, w, h);
+  c.strokeStyle = "rgba(160,210,255,0.08)";
+  c.lineWidth = 1;
+  for (const deg of [0, 45, 90, 135]) {
+    const y = h - (deg / 140) * h;
+    c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke();
+  }
+  c.fillStyle = "rgba(111,139,168,0.7)";
+  c.font = "9px JetBrains Mono, monospace";
+  c.fillText("90°", 2, h - (90 / 140) * h - 3);
+  for (const [idx, color] of [[1, "#22e4ff"], [2, "#ff3df2"]]) {
+    c.strokeStyle = color;
+    c.shadowColor = color;
+    c.shadowBlur = 6;
+    c.lineWidth = 1.5;
+    c.beginPath();
+    let pen = false;
+    for (const s of history) {
+      const v = s[idx];
+      if (v == null) { pen = false; continue; }
+      const x = w - ((now - s[0]) / 10) * w;
+      const y = h - (Math.max(0, Math.min(v, 140)) / 140) * h;
+      pen ? c.lineTo(x, y) : c.moveTo(x, y);
+      pen = true;
+    }
+    c.stroke();
+  }
+  c.shadowBlur = 0;
+}
+
+function drawFeed(rc) {
+  if (!rc.image) return;
+  const w = rc.feed.clientWidth, h = rc.feed.clientHeight, dpr = devicePixelRatio;
+  if (!w || !h) return; // panel collapsed
+  if (rc.feed.width !== Math.round(w * dpr)) { rc.feed.width = Math.round(w * dpr); rc.feed.height = Math.round(h * dpr); }
+  const c = rc.ctx;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.drawImage(rc.image, 0, 0, w, h);
+  c.fillStyle = "rgba(2,6,12,0.25)";
+  c.fillRect(0, 0, w, h);
+  const view = lastFrame?.views?.[rc.info.index];
+  if (!view) return;
+
+  if (view.bbox) {
+    const [x1, y1, x2, y2] = view.bbox;
+    c.strokeStyle = "rgba(34,228,255,0.7)";
+    c.lineWidth = 1;
+    const bw = (x2 - x1) * w, bh = (y2 - y1) * h, L = Math.min(14, bw / 4, bh / 4);
+    for (const [cx, cy, sx, sy] of [[x1, y1, 1, 1], [x2, y1, -1, 1], [x1, y2, 1, -1], [x2, y2, -1, -1]]) {
+      c.beginPath();
+      c.moveTo(cx * w + sx * L, cy * h); c.lineTo(cx * w, cy * h); c.lineTo(cx * w, cy * h + sy * L);
+      c.stroke();
+    }
+  }
+  const K = view.kp2d;
+  if (K) {
+    const legSet = new Set(hello?.leg_joints ?? []);
+    for (const [a, b] of hello?.bones ?? []) {
+      if (!K[a] || !K[b]) continue;
+      const leg = legSet.has(a) && legSet.has(b);
+      if (!leg && !opts.upper) continue;
+      const side = sideOf(b) === "center" ? sideOf(a) : sideOf(b);
+      c.strokeStyle = leg ? (side === "left" ? "#22e4ff" : side === "right" ? "#ff3df2" : "#8fa8ff") : "rgba(143,168,255,0.5)";
+      c.lineWidth = leg ? 2 : 1;
+      c.beginPath(); c.moveTo(K[a][0] * w, K[a][1] * h); c.lineTo(K[b][0] * w, K[b][1] * h); c.stroke();
+    }
+    for (const [name, [u, v]] of Object.entries(K)) {
+      if (!legSet.has(name) && !opts.upper) continue;
+      c.fillStyle = "#fff";
+      c.beginPath(); c.arc(u * w, v * h, 2, 0, Math.PI * 2); c.fill();
+    }
+  }
+  // ArUco outlines (first corner marked, like cv2.aruco.drawDetectedMarkers) and the tip dot.
+  for (const m of view.markers ?? []) {
+    c.strokeStyle = "#3dffa8";
+    c.lineWidth = 1.5;
+    c.beginPath();
+    m.corners.forEach(([u, v], i) => (i ? c.lineTo(u * w, v * h) : c.moveTo(u * w, v * h)));
+    c.closePath();
+    c.stroke();
+    c.fillStyle = "#ff3d6e";
+    c.fillRect(m.corners[0][0] * w - 2, m.corners[0][1] * h - 2, 4, 4);
+    const cx = m.corners.reduce((s, p) => s + p[0], 0) / 4 * w, cy = m.corners.reduce((s, p) => s + p[1], 0) / 4 * h;
+    c.fillStyle = "#3dffa8";
+    c.font = "bold 10px JetBrains Mono, monospace";
+    c.fillText(m.id, cx - 3, cy + 4);
+  }
+  if (view.tip && lastFrame?.probe?.tracked) {
+    const [u, v] = view.tip;
+    c.fillStyle = "#ff2a2a";
+    c.shadowColor = "#ff2a2a";
+    c.shadowBlur = 10;
+    c.beginPath(); c.arc(u * w, v * h, 4.5, 0, Math.PI * 2); c.fill();
+    c.shadowBlur = 0;
+  }
+}
+
+// ───────────────────────────── rig panel ─────────────────────────────
+function renderRigList() {
+  const list = $("rig-list");
+  list.innerHTML = "";
+  for (const rc of rigCams) {
+    const cam = rc.info;
+    const li = document.createElement("li");
+    li.dataset.cam = cam.index;
+    const world = cam.index === 0;
+    const ok = world || cam.T_world_camera;
+    li.innerHTML = `<span class="dot ${ok ? "ok" : "idle"}"></span>` +
+      `<b>CAM ${cam.index + 1} · …${cam.serial.slice(-4)}</b>` +
+      `<span class="state ${ok ? "" : "warn"}">${world ? "WORLD" : ok ? "CALIBRATED" : "UNCALIBRATED"}</span>` +
+      `<small>${cam.name} · ${cam.width}×${cam.height}@${cam.fps} · USB ${cam.usb}</small>`;
+    list.appendChild(li);
+  }
+  $("rig-meta").textContent = `${rigCams.length} CAM${rigCams.length === 1 ? "" : "S"}`;
+  $("stat-cams").textContent = rigCams.length;
+  const calBtn = $("rig-calibrate");
+  calBtn.disabled = rigCams.length < 2 || !probeState.info;
+  calBtn.title = rigCams.length < 2 ? "Connect a second camera to calibrate the rig" : "";
+  if (rigCams.length < 2) rigMsg("Single camera — connect another RealSense to fuse views.");
+  else if (rigCams.slice(1).some((rc) => !rc.info.T_world_camera))
+    rigMsg("Hold the probe where every camera sees its tags, then press CALIBRATE RIG.");
+}
+
+let calibrating = false;
+function rigMsg(text, kind = "") {
+  const el = $("rig-msg");
+  el.textContent = text;
+  el.className = "rig-msg " + kind;
+}
+$("rig-calibrate").onclick = () => {
+  if (calibrating) { send({ cmd: "cancel_calibration" }); return; }
+  send({ cmd: "calibrate_rig" });
+};
+function onCalibration(msg) {
+  calibrating = msg.state === "collecting";
+  $("rig-calibrate").textContent = calibrating ? "CANCEL" : "CALIBRATE RIG";
+  $("cal-progress").hidden = !calibrating;
+  if (!calibrating) $("cal-progress").firstElementChild.style.width = "0";
+  rigMsg(msg.message, { done: "ok", failed: "err" }[msg.state] ?? "");
+}
+
+// ───────────────────────────── views ─────────────────────────────
+const followTarget = new THREE.Vector3(0, 0.9, -2.5);
+function setView(kind) {
+  const t = followTarget;
+  const offsets = {
+    reset: new THREE.Vector3(1.9, 0.9, 2.6),
+    side: new THREE.Vector3(3.2, 0.1, 0.001),
+    top: new THREE.Vector3(0.001, 4.5, 0.4),
+  };
+  camera.position.copy(t).add(offsets[kind]);
+  controls.target.copy(t);
+}
+$("view-reset").onclick = () => setView("reset");
+$("view-side").onclick = () => setView("side");
+$("view-top").onclick = () => setView("top");
+setView("reset");
+
+function applyVisibility() {
+  for (const rc of rigCams) rc.cloud.visible = opts.cloud;
+  floor.visible = opts.grid;
+  footTrails.left.line.visible = footTrails.right.line.visible = opts.trails;
+  tipTrail.line.visible = opts.tiptrail && opts.probe;
+  controls.autoRotate = opts.orbit;
+  if (lastFrame) updateSkeleton(lastFrame.person);
+}
+applyVisibility();
+
+// ───────────────────────────── websocket ─────────────────────────────
+let socket = null;
+let retry = 0;
+function send(msg) {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
+}
+function connect() {
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  socket = ws;
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { retry = 0; };
+  ws.onclose = () => {
+    setStatus("offline", "Pipeline unreachable — retrying…");
+    setTimeout(connect, Math.min(500 * 2 ** retry++, 5000));
+  };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== "string") return onBinary(ev.data);
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "hello") onHello(msg);
+    else if (msg.type === "status") setStatus(msg.state, msg.message);
+    else if (msg.type === "calibration") onCalibration(msg);
+    else if (msg.type === "frame") onFrame(msg);
+  };
+}
+
+function onHello(msg) {
+  hello = msg;
+  $("stat-backend").textContent = msg.backend === "sam3d_body" ? "SAM3D-B" : "VITPOSE+D";
+  $("stat-backend").title = msg.backend;
+  if (!probeState.info || JSON.stringify(probeState.info) !== JSON.stringify(msg.probe)) buildProbe(msg.probe);
+  buildRig(msg.cameras);
+  buildSkeleton(msg);
+  meshReady = false;
+  if (msg.has_mesh) loadFaces();
+  applyVisibility();
+}
+
+function onBinary(buf) {
+  const head = new Uint8Array(buf, 0, 2);
+  const kind = head[0], cam = head[1];
+  if (kind === MSG_MESH) onMesh(buf);
+  else if (kind === MSG_CLOUD) onCloud(cam, buf);
+  else if (kind === MSG_JPEG) {
+    const rc = rigCams[cam];
+    if (!rc) return;
+    createImageBitmap(new Blob([new Uint8Array(buf, 8)], { type: "image/jpeg" }))
+      .then((bmp) => { rc.image?.close?.(); rc.image = bmp; drawFeed(rc); })
+      .catch(() => {});
+  }
+}
+
+let personSeenAt = 0;
+function onFrame(frame) {
+  lastFrame = frame;
+  if (frame.person) personSeenAt = performance.now();
+  updateLevel(frame);
+  updateSkeleton(frame.person);
+  updateFootTrails(frame.person);
+  updateProbe(frame.probe);
+  updateHud(frame);
+  if (frame.person && opts.follow) {
+    const p = frame.person.joints.pelvis;
+    if (p) {
+      const target = sensorRoot.localToWorld(new THREE.Vector3(p[0], p[1], p[2]));
+      target.y = Math.max(0.6, target.y);
+      followTarget.lerp(target, 0.15);
+    }
+  }
+}
+
+// ───────────────────────────── render loop ─────────────────────────────
+const clock = new THREE.Clock();
+const _focus = new THREE.Vector3();
+function tick() {
+  requestAnimationFrame(tick);
+  const t = clock.getElapsedTime();
+  holoMat.uniforms.uTime.value = t;
+
+  worldRoot.quaternion.slerp(levelTarget.quat, 0.05);
+  worldRoot.position.y += (levelTarget.height - worldRoot.position.y) * 0.05;
+
+  // mesh fades in while fresh, out when the subject is lost
+  const meshLive = meshReady && opts.mesh && performance.now() - lastMeshAt < 600;
+  const u = holoMat.uniforms.uOpacity;
+  u.value += ((meshLive ? 1 : 0) - u.value) * 0.12;
+  holo.visible = u.value > 0.01;
+
+  // Probe stays at its last pose briefly after the tags drop out, then hides.
+  const probeFresh = performance.now() - probeState.lastSeen < 700;
+  probeGroup.visible = opts.probe && !!probeState.info && probeFresh;
+  if (probeState.tipLabel) probeState.tipLabel.obj.visible = probeGroup.visible && opts.labels;
+
+  if (opts.follow && performance.now() - personSeenAt < 1500) {
+    const delta = _focus.copy(followTarget).sub(controls.target).multiplyScalar(0.08);
+    controls.target.add(delta);
+    camera.position.add(delta);
+  }
+  floorMat.uniforms.uFocus.value.set(controls.target.x, controls.target.z);
+  dust.rotation.y = t * 0.004;
+
+  controls.update();
+  render();
+  labelRenderer.render(scene, camera);
+}
+tick();
+connect();
+
+// Debug handle for the browser console.
+window.vigil = { scene, camera, controls, probeGroup, get skel() { return skel; }, get frame() { return lastFrame; }, get rig() { return rigCams; } };

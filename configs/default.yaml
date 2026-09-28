@@ -1,0 +1,88 @@
+# Vigil default configuration.
+# Relative paths are resolved against the project root (the parent of configs/).
+# Secrets (HF_TOKEN) live in .env, never here.
+
+cameras:
+  # RealSense serials to use (`uv run vigil camera` lists them). [] = every connected
+  # camera, sorted by serial. The FIRST camera defines the world frame; the others are
+  # placed with configs/extrinsics.yaml (created by CALIBRATE RIG in the dashboard).
+  serials: []
+  # Stream modes tried in order (width, height, fps).
+  modes:
+    - [848, 480, 30]
+    - [640, 480, 30]
+    - [640, 480, 15]
+  # Used instead when a camera enumerates on USB 2 (USB 3 is needed for 848x480@30).
+  usb2_modes:
+    - [640, 480, 30]
+  depth_min_m: 0.2
+  depth_max_m: 6.0
+  depth_filters:
+    spatial: false      # 15 ms/frame; too slow for 30 fps
+    temporal: true
+    hole_filling: false
+  extrinsics_path: configs/extrinsics.yaml
+
+detector:
+  # Person detector (transformers). Used by both pose backends.
+  model_id: PekingU/rtdetr_v2_r50vd
+  score_threshold: 0.5
+  # Which person to track when several are visible: closest | largest | confident.
+  # The current subject is kept while it stays visible (IoU tracking).
+  select: closest
+  max_distance_m: 5.0   # ignore people further than this (D435 depth degrades past ~5 m)
+
+estimator:
+  # sam3d_body    : Meta SAM 3D Body (most accurate; gated weights, run `vigil setup` first)
+  # vitpose_depth : transformers ViTPose 2D keypoints lifted to 3D with RealSense depth
+  backend: vitpose_depth
+  device: cuda
+
+  sam3d_body:
+    hf_repo_id: facebook/sam-3d-body-dinov3   # or facebook/sam-3d-body-vith (smaller, faster)
+    repo_dir: third_party/sam-3d-body
+    inference_type: body        # body = body decoder only (faster), full = also refines hands
+    use_camera_intrinsics: true # feed the RealSense color intrinsics instead of a guessed FOV
+    anchor_to_depth: true       # correct the predicted distance using measured depth at the legs
+    limb_radius_m: 0.06         # joint centre sits this far behind the depth surface
+    send_mesh: true
+
+  vitpose_depth:
+    model_id: usyd-community/vitpose-plus-base
+    min_score: 0.3
+    depth_patch_px: 7           # median depth over a square patch around each keypoint
+    limb_radius_m: 0.06
+    max_depth_jump_m: 1.0       # reject keypoints whose depth disagrees with the body median
+    compile: true               # CUDA graphs: ~4 ms for both cameras (vs ~16 ms); ~25 s startup
+    half: true
+
+probe:
+  # ArUco-cube ultrasound probe (ported from DataCollection).
+  enabled: true
+  dictionary: DICT_6X6_50       # tags 0-4: front, back, right, left, bottom faces
+  marker_length_m: 0.04         # printed black square, excluding the white margin
+  cube_size_m: [0.05, 0.05, 0.05]
+  tip_in_object_m: [0.0, 0.1925096, -0.003594]   # tip in the cube frame (probe along +Y)
+  model_path: assets/probe/ClariusFinal.glb       # metres, cube-centred object frame
+  filter_preset: configs/probe-filter.json        # DataCollection tuning (method + noise)
+  filter_method: null           # override: raw | kalman | ekf | one_euro
+  calibration_samples: 60       # still frames per camera for CALIBRATE RIG
+
+smoothing:
+  enabled: true
+  min_cutoff: 1.5   # One Euro filter: lower = smoother when still
+  beta: 0.3         # higher = less lag during fast motion
+
+scene:
+  point_cloud: true
+  point_cloud_stride: 4      # sample every Nth pixel of the depth image
+  point_cloud_every_n: 2     # send the cloud every N processed frames
+  floor_detection: true      # RANSAC ground plane from depth so the scene is level
+  floor_max_tilt_deg: 50
+  floor_every_n: 15
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  preview_width: 424
+  preview_jpeg_quality: 70

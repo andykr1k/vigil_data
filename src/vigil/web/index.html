@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VIGIL · Leg Pose</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2 L29 9.5 V22.5 L16 30 L3 22.5 V9.5 Z' fill='%2302050a' stroke='%2322e4ff' stroke-width='2'/%3E%3Ccircle cx='16' cy='15' r='4' fill='%2322e4ff'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="stage"></div>
+  <div class="vignette"></div>
+
+  <!-- ───────────── top-left: identity, telemetry, angles ───────────── -->
+  <aside class="hud hud-left">
+    <section class="panel" id="panel-status">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M16 2 L29 9.5 V22.5 L16 30 L3 22.5 V9.5 Z" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M16 8 L22 11.5 V18.5 L16 22 L10 18.5 V11.5 Z" fill="currentColor" opacity=".35"/>
+          <circle cx="16" cy="15" r="2.2" fill="currentColor"/>
+        </svg>
+        <div>
+          <h1>VIGIL</h1>
+          <p>LOWER-LIMB KINEMATICS</p>
+        </div>
+      </div>
+      <div class="status-line">
+        <span class="dot" id="status-dot"></span>
+        <span id="status-state">LINKING</span>
+        <span class="subject" id="subject-state"></span>
+      </div>
+      <p class="status-msg" id="status-msg">Connecting to pipeline…</p>
+      <dl class="stats">
+        <div><dt>MODEL</dt><dd id="stat-backend">—</dd></div>
+        <div><dt>STREAM FPS</dt><dd id="stat-fps">—</dd></div>
+        <div><dt>BODY FPS</dt><dd id="stat-body-fps">—</dd></div>
+        <div><dt>LATENCY</dt><dd id="stat-latency">—</dd></div>
+        <div><dt>POSE</dt><dd id="stat-pose">—</dd></div>
+        <div><dt>PROBE</dt><dd id="stat-probe">—</dd></div>
+        <div><dt>CAMERAS</dt><dd id="stat-cams">—</dd></div>
+        <div><dt>IN VIEW</dt><dd id="stat-people">—</dd></div>
+        <div><dt>DET AGE</dt><dd id="stat-detect">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="panel collapsible" id="panel-angles">
+      <header><span>JOINT ANGLES</span><span class="unit">DEG</span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body">
+        <div class="angle-grid">
+          <span></span><span class="side l">LEFT</span><span class="side r">RIGHT</span>
+          <span class="joint">HIP FLEX</span>
+          <div class="cell l" data-angle="left_hip"><b>—</b><i></i></div>
+          <div class="cell r" data-angle="right_hip"><b>—</b><i></i></div>
+          <span class="joint">KNEE FLEX</span>
+          <div class="cell l" data-angle="left_knee"><b>—</b><i></i></div>
+          <div class="cell r" data-angle="right_knee"><b>—</b><i></i></div>
+          <span class="joint">ANKLE</span>
+          <div class="cell l" data-angle="left_ankle"><b>—</b><i></i></div>
+          <div class="cell r" data-angle="right_ankle"><b>—</b><i></i></div>
+        </div>
+        <div class="spark-head"><span>KNEE FLEXION · 10 s</span><span><em class="l">■ L</em> <em class="r">■ R</em></span></div>
+        <canvas id="spark"></canvas>
+      </div>
+    </section>
+
+    <section class="panel collapsible" id="panel-probe">
+      <header><span>PROBE</span><span class="unit" id="probe-state">OFFLINE</span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body">
+        <div class="tag-chips" id="tag-chips">
+          <span data-tag="0">0</span><span data-tag="1">1</span><span data-tag="2">2</span><span data-tag="3">3</span><span data-tag="4">4</span>
+          <em id="probe-cams"></em>
+        </div>
+        <div class="tip-readout">
+          <div><dt>TIP X</dt><dd id="tip-x">—</dd></div>
+          <div><dt>TIP Y ↑</dt><dd id="tip-y">—</dd></div>
+          <div><dt>TIP Z</dt><dd id="tip-z">—</dd></div>
+        </div>
+        <div class="nearest">
+          <span>NEAREST BONE</span>
+          <b id="nearest-seg">—</b>
+          <b class="dist" id="nearest-dist">—</b>
+        </div>
+        <div class="seg-row" id="probe-filter">
+          <button data-method="raw">RAW</button>
+          <button data-method="kalman">KALMAN</button>
+          <button data-method="ekf">EKF</button>
+          <button data-method="one_euro">1€</button>
+        </div>
+        <div class="btn-row one"><button id="probe-reset">RESET FILTER</button></div>
+      </div>
+    </section>
+  </aside>
+
+  <!-- ───────────── top-right: display toggles, sensor feed ───────────── -->
+  <aside class="hud hud-right">
+    <section class="panel collapsible" id="panel-display">
+      <header><span>DISPLAY</span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body toggles">
+        <label class="toggle"><span>Mesh</span><input type="checkbox" data-toggle="mesh" checked><i></i></label>
+        <label class="toggle"><span>Skeleton</span><input type="checkbox" data-toggle="skeleton" checked><i></i></label>
+        <label class="toggle"><span>Upper body</span><input type="checkbox" data-toggle="upper"><i></i></label>
+        <label class="toggle"><span>Angles</span><input type="checkbox" data-toggle="labels" checked><i></i></label>
+        <label class="toggle"><span>Probe</span><input type="checkbox" data-toggle="probe" checked><i></i></label>
+        <label class="toggle"><span>Tip trail</span><input type="checkbox" data-toggle="tiptrail" checked><i></i></label>
+        <label class="toggle"><span>Cloud</span><input type="checkbox" data-toggle="cloud" checked><i></i></label>
+        <label class="toggle"><span>Foot trail</span><input type="checkbox" data-toggle="trails" checked><i></i></label>
+        <label class="toggle"><span>Grid</span><input type="checkbox" data-toggle="grid" checked><i></i></label>
+        <label class="toggle"><span>Follow</span><input type="checkbox" data-toggle="follow" checked><i></i></label>
+        <label class="toggle"><span>Orbit</span><input type="checkbox" data-toggle="orbit"><i></i></label>
+        <label class="toggle"><span>Bloom</span><input type="checkbox" data-toggle="bloom" checked><i></i></label>
+        <div class="btn-row">
+          <button id="view-reset">RESET</button>
+          <button id="view-side">SIDE</button>
+          <button id="view-top">TOP</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel collapsible" id="panel-rig">
+      <header><span>RIG</span><span class="unit" id="rig-meta"></span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body">
+        <ul class="rig-list" id="rig-list"></ul>
+        <div class="btn-row one"><button id="rig-calibrate">CALIBRATE RIG</button></div>
+        <div class="cal-progress" id="cal-progress" hidden><i></i></div>
+        <p class="rig-msg" id="rig-msg"></p>
+      </div>
+    </section>
+
+    <section class="panel collapsible" id="panel-feed">
+      <header><span>SENSOR FEEDS</span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body feeds" id="feeds"></div>
+    </section>
+  </aside>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
