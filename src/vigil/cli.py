@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import socket
 import subprocess
 import sys
 import time
@@ -24,7 +25,19 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.backend:
         cfg.estimator.backend = args.backend
     host, port = args.host or cfg.server.host, args.port or cfg.server.port
-    print(f"\n  Vigil dashboard → http://{'localhost' if host in ('0.0.0.0', '127.0.0.1') else host}:{port}\n")
+    # Check the port before anything opens the cameras: a second instance would otherwise
+    # grab-and-fail on busy cameras and bury the real cause.
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+        except OSError:
+            sys.exit(f"\n  Port {port} is already in use — Vigil is probably already running "
+                     f"(open http://localhost:{port}), or pass --port.\n")
+    url = f"http://{'localhost' if host in ('0.0.0.0', '127.0.0.1') else host}:{port}"
+    print(f"\n  Vigil dashboard → {url}\n"
+          "  The server keeps running until Ctrl+C. First start compiles the pose model\n"
+          "  (~30-40 s); the dashboard shows BOOTING until the cameras are live.\n")
     uvicorn.run(create_app(cfg), host=host, port=port, log_level="info")
 
 
