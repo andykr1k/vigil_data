@@ -174,8 +174,7 @@ const floorMat = new THREE.ShaderMaterial({
       float d = length(p - uFocus);
       float fade = exp(-d * 0.22);
       float g = grid(p, 0.25, 1.0) * 0.22 + grid(p, 1.0, 1.4) * 0.75;
-      float glow = exp(-d * d * 3.5) * 0.3;
-      float a = g * fade + glow;
+      float a = g * fade;
       gl_FragColor = vec4(uColor * a, a);
     }`,
 });
@@ -202,7 +201,8 @@ scene.add(dust);
 const CLOUD_MAX = 200_000;
 let rigCams = []; // per camera: { info, group, cloudGeo, feed, image }
 
-function makeSensorGlyph(cam, highlight) {
+function makeSensorGlyph(cam, highlight, calibrated) {
+  const color = !calibrated ? "#ffc53d" : highlight ? "#22e4ff" : "#7d8cff";
   const g = new THREE.Group();
   const d = 0.35, w = cam.width, h = cam.height;
   const corners = [[0, 0], [w, 0], [w, h], [0, h]].map(([u, v]) =>
@@ -211,14 +211,14 @@ function makeSensorGlyph(cam, highlight) {
   corners.forEach((c, i) => { pts.push(new THREE.Vector3(), c, c, corners[(i + 1) % 4]); });
   g.add(glow(new THREE.LineSegments(
     new THREE.BufferGeometry().setFromPoints(pts),
-    new THREE.LineBasicMaterial({ color: highlight ? "#22e4ff" : "#7d8cff", transparent: true, opacity: 0.55 }))));
+    new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.55 }))));
   const body = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.025, 0.025), new THREE.MeshBasicMaterial({ color: "#0f3550" }));
   body.position.z = -0.013;
   g.add(body, glow(new THREE.Mesh(new THREE.SphereGeometry(0.006, 12, 12), new THREE.MeshBasicMaterial({ color: "#8ff4ff" }))));
   const el = document.createElement("div");
   el.className = "tag";
-  el.style.color = highlight ? "#22e4ff" : "#7d8cff";
-  el.textContent = `CAM ${cam.index + 1}`;
+  el.style.color = color;
+  el.textContent = calibrated ? `CAM ${cam.index + 1}` : `CAM ${cam.index + 1} · UNCALIBRATED`;
   const label = new CSS2DObject(el);
   label.position.set(0, -0.05, 0);
   g.add(label);
@@ -232,9 +232,12 @@ function buildRig(cameras) {
   rigCams = cameras.map((cam) => {
     const group = new THREE.Group();
     group.matrixAutoUpdate = false;
-    if (cam.T_world_camera) group.matrix.set(...cam.T_world_camera);
-    group.visible = !!cam.T_world_camera;
-    group.add(makeSensorGlyph(cam, cam.index === 0));
+    const calibrated = !!cam.T_world_camera;
+    // Until CALIBRATE RIG places it, show the camera beside CAM 1 so its viewpoint and
+    // cloud are still visible (amber = placeholder pose, not its real position).
+    if (calibrated) group.matrix.set(...cam.T_world_camera);
+    else group.matrix.makeTranslation(0.35 * cam.index, 0, 0);
+    group.add(makeSensorGlyph(cam, cam.index === 0, calibrated));
 
     const cloudGeo = new THREE.BufferGeometry();
     cloudGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(CLOUD_MAX * 3), 3).setUsage(THREE.DynamicDrawUsage));
@@ -242,7 +245,8 @@ function buildRig(cameras) {
     cloudGeo.setDrawRange(0, 0);
     const cloud = new THREE.Points(cloudGeo, new THREE.PointsMaterial({
       size: 0.014, vertexColors: true, transparent: true, opacity: 0.8, depthWrite: false,
-      color: new THREE.Color(0.32, 0.4, 0.48), // keep real colours muted behind the subject
+      // Real colours, muted behind the subject; amber-tinted while the pose is a placeholder.
+      color: calibrated ? new THREE.Color(0.32, 0.4, 0.48) : new THREE.Color(0.55, 0.42, 0.18),
     }));
     cloud.frustumCulled = false;
     cloud.visible = opts.cloud;
@@ -258,6 +262,15 @@ function buildRig(cameras) {
     return { info: cam, group, cloud, cloudGeo, feed, ctx: feed.getContext("2d"), image: null };
   });
   renderRigList();
+  const views = $("view-cams");
+  views.innerHTML = "";
+  for (const rc of rigCams) {
+    const b = document.createElement("button");
+    b.textContent = `CAM ${rc.info.index + 1}`;
+    b.title = "View the scene from this camera";
+    b.onclick = () => viewFromCamera(rc);
+    views.appendChild(b);
+  }
 }
 
 function onCloud(cam, buf) {
@@ -465,10 +478,26 @@ function updateFootTrails(person) {
 // probeGroup's matrix is the cube pose (object → world); children live in the cube frame.
 const probeGroup = new THREE.Group();
 probeGroup.matrixAutoUpdate = false;
+// Until the tags are first seen, park the probe where DataCollection's viewer starts:
+// 0.6 m in front of CAM 1, tag 0 (+Z face) towards the camera, probe pointing up.
+probeGroup.matrix.set(1, 0, 0, 0, 0, -1, 0, 0, 0, 0, -1, 0.6, 0, 0, 0, 1);
 probeGroup.visible = false;
 sensorRoot.add(probeGroup);
 const tipTrail = makeTrail(COLORS.tip, 240);
-const probeState = { info: null, lastSeen: 0, tipLabel: null, method: null };
+const probeState = { info: null, lastSeen: 0, tipLabel: null, method: null, materials: [], live: null };
+
+function probeMaterial(mat) {
+  mat.transparent = true;
+  mat.userData.baseOpacity = mat.opacity;
+  probeState.materials.push(mat);
+  return mat;
+}
+// Tracked: solid. Not tracked (never seen, or tags lost): ghosted at the last known pose.
+function setProbeLive(live) {
+  if (live === probeState.live) return;
+  probeState.live = live;
+  for (const m of probeState.materials) m.opacity = m.userData.baseOpacity * (live ? 1 : 0.3);
+}
 
 const nearestLine = glow(new THREE.Line(
   new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
@@ -479,6 +508,8 @@ sensorRoot.add(nearestLine);
 
 function buildProbe(info) {
   probeGroup.clear();
+  probeState.materials = [];
+  probeState.live = null;
   probeState.info = info;
   if (!info) return;
 
@@ -487,16 +518,19 @@ function buildProbe(info) {
     model.traverse((o) => {
       if (!o.isMesh) return;
       o.geometry.computeVertexNormals(); // exported without normals
-      o.material = new THREE.MeshStandardMaterial({
+      o.material = probeMaterial(new THREE.MeshStandardMaterial({
         color: "#9fb0c2", metalness: 0.35, roughness: 0.42, side: THREE.DoubleSide,
         polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
-      });
+      }));
       // Faint cyan edges read as "tracked object" and survive the dark scene.
       const edges = glow(new THREE.LineSegments(new THREE.EdgesGeometry(o.geometry, 35),
-        new THREE.LineBasicMaterial({ color: "#22e4ff", transparent: true, opacity: 0.35 })));
+        probeMaterial(new THREE.LineBasicMaterial({ color: "#22e4ff", opacity: 0.35 }))));
       o.add(edges);
     });
     probeGroup.add(model);
+    const live = probeState.live;
+    probeState.live = null;
+    setProbeLive(!!live); // apply the current state to the freshly loaded materials
   }, undefined, (err) => console.warn("probe model failed to load", err));
 
   // ArUco tags on their cube faces (texture includes the printed white margin).
@@ -506,7 +540,7 @@ function buildProbe(info) {
     tex.colorSpace = THREE.SRGBColorSpace;
     tex.magFilter = THREE.NearestFilter; // keep the code cells sharp
     const plane = new THREE.Mesh(new THREE.PlaneGeometry(info.tag_size, info.tag_size),
-      new THREE.MeshBasicMaterial({ map: tex, color: new THREE.Color(0.78, 0.78, 0.78), polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+      probeMaterial(new THREE.MeshBasicMaterial({ map: tex, color: new THREE.Color(0.78, 0.78, 0.78), polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 })));
     const x = new THREE.Vector3(...m.x_axis), y = new THREE.Vector3(...m.y_axis);
     const z = new THREE.Vector3().crossVectors(x, y);
     plane.matrix.makeBasis(x, y, z).setPosition(new THREE.Vector3(...m.center).addScaledVector(z, 0.0004));
@@ -518,9 +552,9 @@ function buildProbe(info) {
   // The tip: a red dot with a halo and a label.
   const tip = new THREE.Group();
   tip.position.set(...info.tip);
-  tip.add(glow(new THREE.Mesh(new THREE.SphereGeometry(0.0045, 20, 14), new THREE.MeshBasicMaterial({ color: COLORS.tip }))));
-  tip.add(glow(new THREE.Mesh(new THREE.SphereGeometry(0.011, 20, 14), new THREE.MeshBasicMaterial({
-    color: COLORS.tip, transparent: true, opacity: 0.18, depthWrite: false, blending: THREE.AdditiveBlending }))));
+  tip.add(glow(new THREE.Mesh(new THREE.SphereGeometry(0.0045, 20, 14), probeMaterial(new THREE.MeshBasicMaterial({ color: COLORS.tip })))));
+  tip.add(glow(new THREE.Mesh(new THREE.SphereGeometry(0.011, 20, 14), probeMaterial(new THREE.MeshBasicMaterial({
+    color: COLORS.tip, opacity: 0.18, depthWrite: false, blending: THREE.AdditiveBlending })))));
   const el = document.createElement("div");
   el.className = "tag";
   el.style.color = "#ff5a5a";
@@ -531,8 +565,12 @@ function buildProbe(info) {
   probeGroup.add(tip);
 
   // Cube axes, as in DataCollection's viewer (X red, Y green, Z blue).
-  probeGroup.add(new THREE.AxesHelper(0.06));
+  const axes = new THREE.AxesHelper(0.06);
+  probeMaterial(axes.material);
+  probeGroup.add(axes);
   setProbeMethod(info.method);
+  setProbeLive(false);
+  probeState.tipLabel.el.innerHTML = "<small>PROBE</small>NOT TRACKED";
 }
 
 const _m4 = new THREE.Matrix4();
@@ -835,6 +873,8 @@ function onCalibration(msg) {
 // ───────────────────────────── views ─────────────────────────────
 const followTarget = new THREE.Vector3(0, 0.9, -2.5);
 function setView(kind) {
+  camera.fov = 50;
+  camera.updateProjectionMatrix();
   const t = followTarget;
   const offsets = {
     reset: new THREE.Vector3(1.9, 0.9, 2.6),
@@ -843,6 +883,23 @@ function setView(kind) {
   };
   camera.position.copy(t).add(offsets[kind]);
   controls.target.copy(t);
+}
+function viewFromCamera(rc) {
+  // Stand where the camera is, look down its optical axis, with its vertical field of view.
+  setFollow(false);
+  scene.updateMatrixWorld(true);
+  const m = rc.group.matrixWorld;
+  const pos = new THREE.Vector3().setFromMatrixPosition(m);
+  const fwd = new THREE.Vector3(0, 0, 1).transformDirection(m);
+  camera.position.copy(pos);
+  controls.target.copy(pos).addScaledVector(fwd, 1.5);
+  camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(rc.info.height / 2 / rc.info.fy));
+  camera.updateProjectionMatrix();
+}
+function setFollow(on) {
+  const el = document.querySelector('[data-toggle="follow"]');
+  el.checked = opts.follow = on;
+  store.set("t.follow", on);
 }
 $("view-reset").onclick = () => setView("reset");
 $("view-side").onclick = () => setView("side");
@@ -946,10 +1003,14 @@ function tick() {
   u.value += ((meshLive ? 1 : 0) - u.value) * 0.12;
   holo.visible = u.value > 0.01;
 
-  // Probe stays at its last pose briefly after the tags drop out, then hides.
-  const probeFresh = performance.now() - probeState.lastSeen < 700;
-  probeGroup.visible = opts.probe && !!probeState.info && probeFresh;
-  if (probeState.tipLabel) probeState.tipLabel.obj.visible = probeGroup.visible && opts.labels;
+  // The probe is always shown: solid while tracked, ghosted at its last pose otherwise.
+  const probeFresh = probeState.lastSeen > 0 && performance.now() - probeState.lastSeen < 500;
+  probeGroup.visible = opts.probe && !!probeState.info;
+  setProbeLive(probeFresh);
+  if (probeState.tipLabel) {
+    probeState.tipLabel.obj.visible = probeGroup.visible && opts.labels;
+    if (!probeFresh) probeState.tipLabel.el.innerHTML = "<small>PROBE</small>NOT TRACKED";
+  }
 
   if (opts.follow && performance.now() - personSeenAt < 1500) {
     const delta = _focus.copy(followTarget).sub(controls.target).multiplyScalar(0.08);

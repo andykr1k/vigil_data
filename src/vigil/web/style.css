@@ -151,6 +151,8 @@ html, body {
 /* ───────────── toggles ───────────── */
 .toggles { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 14px; }
 .toggles .btn-row { grid-column: 1 / -1; }
+#view-cams { margin-top: 6px; grid-template-columns: repeat(auto-fit, minmax(60px, 1fr)); }
+#view-cams:empty { display: none; }
 .toggle {
   display: flex; align-items: center; justify-content: space-between;
   padding: 6px 2px; cursor: pointer; user-select: none;

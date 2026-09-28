@@ -209,10 +209,11 @@ class Pipeline:
                 if fresh[rc.index]:
                     binaries.append(_pack(MSG_JPEG, rc.index, seq,
                                           self._preview(frames[rc.index].color)))
-            # Clouds are the heaviest payload; cameras take turns.
+            # Clouds are the heaviest payload; cameras take turns. Uncalibrated cameras send
+            # theirs too: the dashboard shows them at a placeholder pose until calibrated.
             if sc.point_cloud and seq % sc.point_cloud_every_n == 0:
                 rc = rig.cameras[(seq // sc.point_cloud_every_n) % n]
-                if rc.calibrated and frames[rc.index] is not None:
+                if frames[rc.index] is not None:
                     xyz, rgb = self._cloud(frames[rc.index], rc)
                     binaries.append(_pack(MSG_CLOUD, rc.index, seq,
                                           struct.pack("<I", len(xyz)) + _mm(xyz) + rgb.tobytes()))

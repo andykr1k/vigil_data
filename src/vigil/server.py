@@ -133,5 +133,13 @@ def create_app(cfg: Config) -> FastAPI:
             receiver.cancel()
             hub.clients.discard(client)
 
+    @app.middleware("http")
+    async def no_cache(request, call_next):
+        # Always revalidate the dashboard files, so an update is never masked by a stale cache.
+        response = await call_next(request)
+        if not request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")
     return app
