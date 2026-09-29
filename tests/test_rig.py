@@ -194,3 +194,37 @@ def test_voxel_dedupe_merges_overlapping_points():
     rgb = np.array([[1, 1, 1], [2, 2, 2], [3, 3, 3]], np.uint8)
     xyz, col = voxel_dedupe(a, rgb, 0.01)
     assert len(xyz) == 2 and len(col) == 2
+
+
+def _bare_pipeline():
+    from vigil.config import Config
+    from vigil.pipeline import Pipeline
+
+    return Pipeline(Config(), publish=lambda msg, binaries: None)
+
+
+def test_depth_window_is_clamped_and_never_empty():
+    p = _bare_pipeline()
+    p._set_depth_range({"min": 0.6, "max": 1.4})
+    assert p.depth_range == (0.6, 1.4)
+    p._set_depth_range({"min": -3, "max": 99})  # clamped to the sensor limits
+    assert p.depth_range == (0.2, 6.0)
+    p._set_depth_range({"min": 1.0, "max": 0.5})  # inverted → a 2 cm sliver, not empty
+    assert p.depth_range == (1.0, 1.02)
+
+
+def test_masked_feed_blacks_out_pixels_outside_the_window():
+    import cv2
+
+    from vigil.camera import Frame
+
+    p = _bare_pipeline()
+    color = np.full((480, 848, 3), 200, np.uint8)
+    depth = np.full((480, 848), 3.0, np.float32)
+    depth[:, :424] = 1.0  # left half near, right half far
+    frame = Frame(color, depth, 0.0, 0)
+    p._set_depth_range({"min": 0.5, "max": 1.5, "mask_feeds": True})
+    img = cv2.imdecode(np.frombuffer(p._preview(frame), np.uint8), cv2.IMREAD_COLOR)
+    h, w = img.shape[:2]
+    assert img[h // 2, w // 4].mean() > 150  # near half kept
+    assert img[h // 2, 3 * w // 4].mean() < 20  # far half removed

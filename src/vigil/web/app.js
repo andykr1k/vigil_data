@@ -880,6 +880,78 @@ function onCalibration(msg) {
   rigMsg(msg.message, { done: "ok", failed: "err" }[msg.state] ?? "");
 }
 
+// ───────────────────────────── depth window ─────────────────────────────
+// Only pixels whose depth (from their own camera) is inside [min, max] reach the cloud,
+// and optionally the feeds. Applied on the server so every camera and view agrees.
+const depthUI = {
+  min: $("depth-min"), max: $("depth-max"), minNum: $("depth-min-num"), maxNum: $("depth-max-num"),
+  mask: $("depth-mask"), limits: [0.2, 6.0], dragging: false, sendTimer: null, localUntil: 0,
+};
+function depthValues() { return [parseFloat(depthUI.min.value), parseFloat(depthUI.max.value)]; }
+function renderDepthUI() {
+  const [lo, hi] = depthValues();
+  const [a, b] = depthUI.limits;
+  const fill = $("depth-fill");
+  fill.style.left = `${((lo - a) / (b - a)) * 100}%`;
+  fill.style.right = `${(1 - (hi - a) / (b - a)) * 100}%`;
+  if (document.activeElement !== depthUI.minNum) depthUI.minNum.value = lo.toFixed(2);
+  if (document.activeElement !== depthUI.maxNum) depthUI.maxNum.value = hi.toFixed(2);
+  const full = lo <= a + 1e-3 && hi >= b - 1e-3;
+  $("depth-readout").textContent = full ? "ALL" : `${lo.toFixed(2)}–${hi.toFixed(2)} M`;
+  $("depth-readout").style.color = full ? "" : "var(--cyan)";
+}
+function setDepth(lo, hi, { send: doSend = true } = {}) {
+  const [a, b] = depthUI.limits;
+  lo = Math.min(Math.max(lo, a), b);
+  hi = Math.min(Math.max(hi, a), b);
+  if (hi - lo < 0.02) hi = Math.min(lo + 0.02, b); // never collapse to an empty window
+  depthUI.min.value = lo;
+  depthUI.max.value = hi;
+  renderDepthUI();
+  if (!doSend) return;
+  store.set("depth", { min: lo, max: hi, mask: depthUI.mask.checked });
+  depthUI.localUntil = performance.now() + 500; // let the server catch up before syncing back
+  // Throttle while dragging: at most one command every 50 ms, last value always sent.
+  clearTimeout(depthUI.sendTimer);
+  depthUI.sendTimer = setTimeout(() => send({ cmd: "depth_range", min: lo, max: hi, mask_feeds: depthUI.mask.checked }), 50);
+}
+depthUI.min.addEventListener("input", () => {
+  const [lo, hi] = depthValues();
+  setDepth(Math.min(lo, hi - 0.02), hi);
+});
+depthUI.max.addEventListener("input", () => {
+  const [lo, hi] = depthValues();
+  setDepth(lo, Math.max(hi, lo + 0.02));
+});
+for (const el of [depthUI.min, depthUI.max]) {
+  el.addEventListener("pointerdown", () => (depthUI.dragging = true));
+  el.addEventListener("pointerup", () => (depthUI.dragging = false));
+}
+depthUI.minNum.addEventListener("change", () => setDepth(parseFloat(depthUI.minNum.value) || 0, depthValues()[1]));
+depthUI.maxNum.addEventListener("change", () => setDepth(depthValues()[0], parseFloat(depthUI.maxNum.value) || 0));
+depthUI.mask.addEventListener("change", () => setDepth(...depthValues()));
+$("depth-reset").onclick = () => setDepth(...depthUI.limits);
+
+function initDepthUI(limits) {
+  depthUI.limits = limits;
+  for (const el of [depthUI.min, depthUI.max, depthUI.minNum, depthUI.maxNum]) {
+    el.min = limits[0];
+    el.max = limits[1];
+  }
+  // Restore this browser's last window (re-sent so a restarted server picks it up).
+  const saved = store.get("depth", null);
+  depthUI.mask.checked = !!saved?.mask;
+  if (saved) setDepth(saved.min, saved.max);
+  else setDepth(limits[0], limits[1], { send: false });
+}
+function syncDepthUI(range) {
+  // Another dashboard (or a server restart) changed the window: follow it unless dragging.
+  if (!range || depthUI.dragging || performance.now() < depthUI.localUntil) return;
+  const [lo, hi] = depthValues();
+  if (Math.abs(range.min - lo) > 0.005 || Math.abs(range.max - hi) > 0.005) setDepth(range.min, range.max, { send: false });
+  if (depthUI.mask.checked !== range.mask_feeds) depthUI.mask.checked = range.mask_feeds;
+}
+
 // ───────────────────────────── views ─────────────────────────────
 const followTarget = new THREE.Vector3(0, 0.9, -2.5);
 function setView(kind) {
@@ -959,6 +1031,7 @@ function onHello(msg) {
   if (!probeState.info || JSON.stringify(probeState.info) !== JSON.stringify(msg.probe)) buildProbe(msg.probe);
   buildRig(msg.cameras);
   buildSkeleton(msg);
+  initDepthUI(msg.depth_limits ?? [0.2, 6.0]);
   meshReady = false;
   if (msg.has_mesh) loadFaces();
   applyVisibility();
@@ -987,6 +1060,7 @@ function onFrame(frame) {
   updateFootTrails(frame.person);
   updateProbe(frame.probe);
   updateHud(frame);
+  syncDepthUI(frame.depth_range);
   if (frame.person && opts.follow) {
     const p = frame.person.joints.pelvis;
     if (p) {

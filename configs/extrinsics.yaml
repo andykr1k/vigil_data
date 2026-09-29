@@ -1,0 +1,47 @@
+# Camera extrinsics, written by CALIBRATE RIG (probe cube seen by both cameras).
+# T_reference_camera maps camera optical-frame points into the reference camera.
+reference: '327122076391'
+cameras:
+  '327122076391':
+    T_reference_camera:
+    - - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 1.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 1.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+  '327122078549':
+    T_reference_camera:
+    - - -0.756551
+      - -0.541672
+      - 0.366362
+      - -0.261792
+    - - 0.616387
+      - -0.403585
+      - 0.676155
+      - -0.794048
+    - - -0.218396
+      - 0.737367
+      - 0.639213
+      - 0.414491
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    samples: 59
+    rejected: 1
+    spread_mm: 28.43
+    spread_deg: 1.731
+    stderr_mm: 3.7
+    stderr_deg: 0.225
+    calibrated_at: '2026-09-29T16:35:57+00:00'

@@ -129,6 +129,25 @@
       </div>
     </section>
 
+    <section class="panel collapsible" id="panel-depth">
+      <header><span>DEPTH WINDOW</span><span class="unit" id="depth-readout"></span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body">
+        <div class="range2">
+          <div class="track"><i id="depth-fill"></i></div>
+          <input type="range" id="depth-min" min="0.2" max="6" step="0.01" value="0.2" aria-label="Minimum depth">
+          <input type="range" id="depth-max" min="0.2" max="6" step="0.01" value="6" aria-label="Maximum depth">
+        </div>
+        <div class="depth-values">
+          <label>MIN <input type="number" id="depth-min-num" min="0.2" max="6" step="0.05"> m</label>
+          <label>MAX <input type="number" id="depth-max-num" min="0.2" max="6" step="0.05"> m</label>
+        </div>
+        <div class="depth-foot">
+          <label class="toggle"><span>Mask feeds</span><input type="checkbox" id="depth-mask"><i></i></label>
+          <button id="depth-reset">FULL RANGE</button>
+        </div>
+      </div>
+    </section>
+
     <section class="panel collapsible" id="panel-rig">
       <header><span>RIG</span><span class="unit" id="rig-meta"></span><button class="chev" aria-label="Collapse"></button></header>
       <div class="body">

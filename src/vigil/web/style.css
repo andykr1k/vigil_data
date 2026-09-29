@@ -248,3 +248,43 @@ html, body {
   .angle-grid { grid-template-columns: 58px 1fr 1fr; }
   .stats { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* ───────────── depth window ───────────── */
+.range2 { position: relative; height: 26px; }
+.range2 .track {
+  position: absolute; left: 7px; right: 7px; top: 11px; height: 4px;
+  background: rgba(255, 255, 255, 0.08);
+}
+.range2 .track i {
+  position: absolute; top: 0; bottom: 0; background: var(--cyan);
+  box-shadow: 0 0 10px rgba(34, 228, 255, 0.6);
+}
+.range2 input {
+  position: absolute; inset: 0; width: 100%; margin: 0; background: none;
+  -webkit-appearance: none; appearance: none; pointer-events: none;
+}
+.range2 input::-webkit-slider-thumb {
+  -webkit-appearance: none; pointer-events: auto; cursor: grab;
+  width: 14px; height: 14px; border-radius: 50%; background: #02050a;
+  border: 2px solid var(--cyan); box-shadow: 0 0 8px var(--cyan);
+}
+.range2 input::-moz-range-thumb {
+  pointer-events: auto; cursor: grab; width: 12px; height: 12px; border-radius: 50%;
+  background: #02050a; border: 2px solid var(--cyan); box-shadow: 0 0 8px var(--cyan);
+}
+.range2 input::-moz-range-track { background: none; }
+.depth-values { display: flex; justify-content: space-between; margin-top: 8px; }
+.depth-values label { font: 500 8.5px/1 var(--display); letter-spacing: 0.16em; color: var(--dim); }
+.depth-values input {
+  width: 58px; margin: 0 4px; padding: 4px 6px;
+  font: 600 12px/1 var(--mono); color: var(--text); font-variant-numeric: tabular-nums;
+  background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(34, 228, 255, 0.25);
+}
+.depth-values input:focus { outline: none; border-color: var(--cyan); }
+.depth-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; }
+.depth-foot .toggle { flex: 1; }
+.depth-foot button {
+  padding: 7px 10px; cursor: pointer; font: 700 8.5px/1 var(--display); letter-spacing: 0.16em;
+  color: var(--cyan); background: rgba(34, 228, 255, 0.06); border: 1px solid rgba(34, 228, 255, 0.35);
+}
+.depth-foot button:hover { background: rgba(34, 228, 255, 0.16); }

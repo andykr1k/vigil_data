@@ -64,6 +64,10 @@ class Pipeline:
         self.status: dict = {"type": "status", "state": "starting", "message": "Starting…"}
         self.faces: bytes | None = None
         self._commands: queue.SimpleQueue[dict] = queue.SimpleQueue()
+        # Display depth window (m) set from the dashboard; clouds, and optionally feeds,
+        # only show pixels whose depth — from their own camera — falls inside it.
+        self.depth_range = (cfg.cameras.depth_min_m, cfg.cameras.depth_max_m)
+        self.mask_feeds = False
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._main, name="pipeline", daemon=True)
 
@@ -157,6 +161,7 @@ class Pipeline:
             "bones": BONES,
             "has_mesh": self.faces is not None,
             "probe": probe,
+            "depth_limits": [self.cfg.cameras.depth_min_m, self.cfg.cameras.depth_max_m],
         }
         self.publish(self.hello, [])
 
@@ -214,7 +219,7 @@ class Pipeline:
             for rc in rig.cameras:
                 if fresh[rc.index]:
                     binaries.append(_pack(MSG_JPEG, rc.index, seq,
-                                          self._preview(frames[rc.index].color)))
+                                          self._preview(frames[rc.index])))
             # One fused cloud from every calibrated camera (world frame, de-duplicated);
             # uncalibrated cameras take turns sending their own until they're placed.
             if sc.point_cloud and seq % sc.point_cloud_every_n == 0:
@@ -231,7 +236,7 @@ class Pipeline:
                     binaries.append(_pack(MSG_CLOUD, FUSED, seq,
                                           struct.pack("<I", len(xyz)) + _mm(xyz) + rgb.tobytes()))
             if sc.floor_detection and (floor is None or seq % sc.floor_every_n == 0):
-                xyz, _ = self._cloud(frames[0], rig.world)
+                xyz, _ = self._cloud(frames[0], rig.world, full_range=True)
                 floor = _blend_floor(floor, fit_floor(xyz, sc.floor_max_tilt_deg))
 
             now = time.perf_counter()
@@ -250,6 +255,8 @@ class Pipeline:
                 "person": state.person,
                 "probe": probe,
                 "views": views,
+                "depth_range": {"min": self.depth_range[0], "max": self.depth_range[1],
+                                "mask_feeds": self.mask_feeds},
                 "calibration": None if calibrator is None else {
                     "progress": calibrator.progress(), "target": calibrator.target},
                 "floor": None if floor is None else {
@@ -320,6 +327,8 @@ class Pipeline:
                     tracker.set_method(str(msg.get("method")))
                 elif cmd == "probe_reset" and tracker is not None:
                     tracker.filter.reset()
+                elif cmd == "depth_range":
+                    self._set_depth_range(msg)
                 elif cmd == "calibrate_rig":
                     calibrator = self._start_calibration(rig, tracker)
                 elif cmd == "cancel_calibration" and calibrator is not None:
@@ -366,10 +375,23 @@ class Pipeline:
         self.publish({"type": "calibration", "state": state, "message": message}, [])
 
     # ------------------------------------------------------------------ helpers
-    def _cloud(self, frame: Frame, rc: RigCamera):
+    def _set_depth_range(self, msg: dict) -> None:
+        c = self.cfg.cameras
+        lo = float(msg.get("min", self.depth_range[0]))
+        hi = float(msg.get("max", self.depth_range[1]))
+        lo = min(max(lo, c.depth_min_m), c.depth_max_m)
+        hi = min(max(hi, c.depth_min_m), c.depth_max_m)
+        if hi - lo < 0.02:  # keep a sliver open rather than an empty scene
+            hi = min(lo + 0.02, c.depth_max_m)
+        self.depth_range = (round(lo, 3), round(hi, 3))
+        if "mask_feeds" in msg:
+            self.mask_feeds = bool(msg["mask_feeds"])
+
+    def _cloud(self, frame: Frame, rc: RigCamera, full_range: bool = False):
         c, sc = self.cfg.cameras, self.cfg.scene
+        lo, hi = (c.depth_min_m, c.depth_max_m) if full_range else self.depth_range
         return point_cloud(frame.color, frame.depth, rc.camera.intrinsics,
-                           sc.point_cloud_stride, c.depth_min_m, c.depth_max_m)
+                           sc.point_cloud_stride, lo, hi)
 
     def _fused_cloud(self, frames, cams: list[RigCamera]) -> tuple[np.ndarray, np.ndarray]:
         """All calibrated cameras' clouds in the world frame, one point per voxel."""
@@ -378,11 +400,16 @@ class Pipeline:
         rgb = np.concatenate([p[1] for p in parts])
         return voxel_dedupe(xyz.astype(np.float32), rgb, self.cfg.scene.fused_voxel_m)
 
-    def _preview(self, rgb: np.ndarray) -> bytes:
+    def _preview(self, frame: Frame) -> bytes:
         s = self.cfg.server
-        h, w = rgb.shape[:2]
-        small = cv2.resize(rgb, (s.preview_width, round(h * s.preview_width / w)),
-                           interpolation=cv2.INTER_AREA)
+        h, w = frame.color.shape[:2]
+        size = (s.preview_width, round(h * s.preview_width / w))
+        small = cv2.resize(frame.color, size, interpolation=cv2.INTER_AREA)
+        if self.mask_feeds:
+            # Background removal: black out pixels outside the depth window (and no-depth pixels).
+            d = cv2.resize(frame.depth, size, interpolation=cv2.INTER_NEAREST)
+            lo, hi = self.depth_range
+            small = small * ((d >= lo) & (d <= hi))[..., None].astype(np.uint8)
         ok, buf = cv2.imencode(".jpg", small[:, :, ::-1],
                                [cv2.IMWRITE_JPEG_QUALITY, s.preview_jpeg_quality])
         return buf.tobytes() if ok else b""
