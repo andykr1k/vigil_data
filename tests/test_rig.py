@@ -228,3 +228,19 @@ def test_masked_feed_blacks_out_pixels_outside_the_window():
     h, w = img.shape[:2]
     assert img[h // 2, w // 4].mean() > 150  # near half kept
     assert img[h // 2, 3 * w // 4].mean() < 20  # far half removed
+
+
+def test_frame_buffer_returns_frame_nearest_in_time():
+    from vigil.capture import FrameBuffer
+
+    fb = FrameBuffer(64 * 48)
+    try:
+        for i in range(8):  # 30 fps; the buffer keeps the newest few
+            fb.write(np.full((48, 64, 3), i, np.uint8), np.full((48, 64), 1000, np.uint16),
+                     index=i, ts=100.0 + i / 30)
+        assert fb.read(0.001).index == 7
+        f = fb.read(0.001, near_ts=100.0 + 5.2 / 30)
+        assert f.index == 5 and f.color[0, 0, 0] == 5
+        assert abs(f.depth[0, 0] - 1.0) < 1e-6
+    finally:
+        fb.close(unlink=True)

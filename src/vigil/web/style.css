@@ -288,3 +288,13 @@ html, body {
   color: var(--cyan); background: rgba(34, 228, 255, 0.06); border: 1px solid rgba(34, 228, 255, 0.35);
 }
 .depth-foot button:hover { background: rgba(34, 228, 255, 0.16); }
+
+.tag-chips span.bad { color: #fff; background: var(--err); border-color: var(--err); box-shadow: 0 0 10px rgba(255, 77, 106, 0.6); }
+.probe-fit { margin-top: 10px; font-size: 10.5px; color: var(--dim); font-variant-numeric: tabular-nums; min-height: 14px; }
+.probe-fit b { color: var(--text); font-weight: 600; }
+.btn-row.two { grid-template-columns: 1fr 1fr; }
+.rig-list .health { grid-column: 2 / -1; font-size: 10px; font-variant-numeric: tabular-nums; }
+.rig-list .health.good { color: var(--ok); }
+.rig-list .health.fair { color: var(--warn); }
+.rig-list .health.poor { color: var(--err); }
+.feed-head .ir { color: #ff9d3d; font-weight: 700; margin-left: 6px; }

@@ -592,7 +592,18 @@ function updateProbe(probe) {
   setProbeMethod(probe.method);
   const now = performance.now();
   const chips = new Set(probe.tracked ? probe.marker_ids : []);
-  document.querySelectorAll("#tag-chips span").forEach((s) => s.classList.toggle("on", chips.has(+s.dataset.tag)));
+  // Tags a camera saw but dropped as inconsistent with the others (bad detection / loose tag).
+  const bad = new Set((lastFrame?.views ?? []).flatMap((v) => v.rejected_tags ?? []));
+  document.querySelectorAll("#tag-chips span").forEach((s) => {
+    s.classList.toggle("on", chips.has(+s.dataset.tag));
+    s.classList.toggle("bad", bad.has(+s.dataset.tag) && !chips.has(+s.dataset.tag));
+  });
+  const fit = probe.fit;
+  $("probe-fit").innerHTML = fit
+    ? `FIT <b>${fit.rms_px.toFixed(2)} px</b> · ${fit.corners} corners` +
+      (fit.depth_samples ? ` · depth <b>±${fit.depth_rms_mm?.toFixed(0) ?? "—"} mm</b>` : "") +
+      ` · tip: <b>${probe.tip_source === "pivot calibration" ? "PIVOT" : "CAD"}</b>`
+    : `tip: <b>${probe.tip_source === "pivot calibration" ? "PIVOT-CALIBRATED" : "CAD"}</b>`;
   $("probe-cams").textContent = probe.tracked ? `${probe.cameras} CAM${probe.cameras === 1 ? "" : "S"}` : "";
   panel.textContent = probe.tracked ? "TRACKED" : "SEARCHING";
   panel.style.color = probe.tracked ? "var(--ok)" : "var(--warn)";
@@ -649,6 +660,23 @@ document.querySelectorAll("#probe-filter button").forEach((b) => {
   b.onclick = () => send({ cmd: "probe_filter", method: b.dataset.method });
 });
 $("probe-reset").onclick = () => { send({ cmd: "probe_reset" }); tipTrail.clear(); };
+let pivoting = false;
+$("pivot-start").onclick = () => send({ cmd: pivoting ? "pivot_cancel" : "pivot_start" });
+function onPivot(msg) {
+  pivoting = msg.state === "collecting";
+  $("pivot-start").textContent = pivoting ? "CANCEL" : "PIVOT CALIBRATE";
+  $("pivot-progress").hidden = !pivoting;
+  if (!pivoting) $("pivot-progress").firstElementChild.style.width = "0";
+  const el = $("pivot-msg");
+  el.textContent = msg.message;
+  el.className = "rig-msg " + ({ done: "ok", failed: "err" }[msg.state] ?? "");
+}
+function updatePivot(p) {
+  if (!p) return;
+  $("pivot-progress").hidden = false;
+  $("pivot-progress").firstElementChild.style.width = `${Math.round((p.samples / p.target) * 100)}%`;
+  $("pivot-msg").textContent = `Rocking… ${p.samples}/${p.target} frames · ${p.spread_deg.toFixed(0)}° of rotation (need ≥25°)`;
+}
 
 // ───────────────────────────── scene levelling ─────────────────────────────
 const _n = new THREE.Vector3();
@@ -862,6 +890,29 @@ function renderRigList() {
     rigMsg("Hold the probe where every camera sees its tags, then press CALIBRATE RIG.");
 }
 
+function updateRigHealth(frame) {
+  const health = frame.rig_health ?? {};
+  for (const rc of rigCams) {
+    const li = document.querySelector(`#rig-list li[data-cam="${rc.info.index}"]`);
+    if (!li || rc.info.index === 0) continue;
+    let el = li.querySelector(".health");
+    if (!el) { el = document.createElement("small"); el.className = "health"; li.appendChild(el); }
+    const h = health[rc.info.serial];
+    el.className = "health " + (h?.state ?? "");
+    el.textContent = h
+      ? `agrees with CAM 1 to ${h.mm.toFixed(0)} mm / ${h.deg.toFixed(1)}° (${h.state.toUpperCase()})`
+      : rc.info.T_world_camera ? "agreement: show the probe to both cameras" : "";
+  }
+  if (rigCams.length > 1) $("rig-meta").textContent = `${rigCams.length} CAMS · SYNC ${frame.sync_ms?.toFixed(0) ?? "—"} MS`;
+  for (const v of frame.views) {
+    const head = rigCams[v.cam]?.feed?.parentElement?.querySelector(".feed-head span");
+    if (!head) continue;
+    let tag = head.querySelector(".ir");
+    if (v.tag_source === "infrared" && !tag) { tag = document.createElement("span"); tag.className = "ir"; tag.textContent = "IR TAGS"; head.appendChild(tag); }
+    if (v.tag_source !== "infrared" && tag) tag.remove();
+  }
+}
+
 let calibrating = false;
 function rigMsg(text, kind = "") {
   const el = $("rig-msg");
@@ -1020,6 +1071,7 @@ function connect() {
     if (msg.type === "hello") onHello(msg);
     else if (msg.type === "status") setStatus(msg.state, msg.message);
     else if (msg.type === "calibration") onCalibration(msg);
+    else if (msg.type === "pivot") onPivot(msg);
     else if (msg.type === "frame") onFrame(msg);
   };
 }
@@ -1061,6 +1113,8 @@ function onFrame(frame) {
   updateProbe(frame.probe);
   updateHud(frame);
   syncDepthUI(frame.depth_range);
+  updatePivot(frame.pivot);
+  updateRigHealth(frame);
   if (frame.person && opts.follow) {
     const p = frame.person.joints.pelvis;
     if (p) {

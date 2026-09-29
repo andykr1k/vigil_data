@@ -53,15 +53,34 @@ Every connected RealSense is used (or the `cameras.serials` list). The first ser
 2. Press **CALIBRATE RIG** (top-right RIG panel).
 3. Keep it still at a spot for a second or two, then move to a new spot. Repeat until the bar fills (60 still frames per camera by default).
 
-Each still frame gives `T_world←cam = T_world←cube · T_cam←cube⁻¹`. Frames where the cube moved, flipped poses, and outliers are rejected, and the rest are averaged (chordal mean for rotation). The result goes to `configs/extrinsics.yaml` with its standard error. Once calibrated, a camera's point cloud and frustum appear in the scene, its body pose is fused with the others (confidence-weighted per joint), and its probe view joins the probe fusion.
+Each still frame gives `T_world←cam = T_world←cube · T_cam←cube⁻¹`. Frames where the cube moved, flipped poses, and outliers are rejected. The rest are averaged (chordal mean for rotation), then refined by **bundle adjustment**: one solve over the extrinsic plus every frame's cube pose, fitted to the raw tag corners in both cameras. The result goes to `configs/extrinsics.yaml` with its standard error and reprojection error. Once calibrated, a camera's point cloud and frustum join the fused scene, its body keypoints are triangulated with the others, and its tag corners join the probe solve.
+
+**Calibration health:** whenever the world camera and another camera each see the probe on their own, the RIG panel shows how well their poses agree (rolling median, e.g. "agrees with CAM 1 to 4 mm / 1.1° (GOOD)"). If it turns FAIR or POOR, a camera was probably bumped, so recalibrate.
+
+**Time sync:** frames carry the cameras' own capture timestamps (librealsense global time), and each other camera's frame is paired with the world camera's by capture time. If the other camera's next frame is closer and only milliseconds away, the pairing waits for it. The RIG header shows the remaining skew. For zero skew, connect the cameras' 9-pin sync ports with a genlock cable and set `cameras.hardware_sync: true` (first camera master, the others slaves).
 
 A camera on a USB 2 link uses `cameras.usb2_modes` (640×480@30). If a camera stops delivering frames (unplugged, link reset), its process reconnects automatically once it re-enumerates.
 
 ## Probe (ArUco cube)
 
-Ported from the DataCollection project into `src/vigil/probe/`: DICT_6X6_50 tags 0–4 on a 50 mm cube (front, back, right, left, bottom; the Clarius attachment is on +Y). Each camera detects tags, estimates the cube pose from all visible corners in one SQPNP solve with LM refinement (falling back to the largest tag), and the per-camera poses are fused in the world frame, weighted by tag count, with disagreeing views dropped. The fused pose then goes through the selected filter: SE(3) error-state EKF (default, tuned in `configs/probe-filter.json`), One Euro, position Kalman, or raw.
+Ported from the DataCollection project into `src/vigil/probe/`: DICT_6X6_50 tags 0–4 on a 50 mm cube (front, back, right, left, bottom; the Clarius attachment is on +Y). Per frame (`probe/tracker.py`, `probe/solver.py`):
+
+1. **Detect** tags in every camera, in parallel, searching around the last known cube position (with a full-frame pass every 15 frames or when it's lost).
+2. **Clean each view.** With 3+ tags, a tag that the *others* fail to predict (leave-one-out) is dropped: a bad detection or a loose tag. Two tags that disagree keep the larger one. A single tag has two mirror-image poses (the wrong one can even fit better), so pick the one consistent with the previous pose, or with another camera that sees 2+ tags. Rejected tags show red in the probe panel.
+3. **Joint solve:** one Gauss–Newton fit of the cube's world pose over every kept corner in every calibrated camera, plus depth measured *inside* each tag (edges often hit the background). It uses an analytic Jacobian and robust weighting and takes about 2 ms. A single tag is weak along its viewing ray, and the other camera and the depth sensor constrain exactly that. The panel shows the fit (px, corners, depth residual).
+4. **Filter:** SE(3) error-state EKF (default, tuned in `configs/probe-filter.json`), One Euro, position Kalman, or raw.
+
+**Pivot calibration of the tip.** The tip offset starts from CAD (`probe.tip_in_object_m`, 192.5 mm along +Y). Press **PIVOT CALIBRATE**, rest the tip in a fixed divot, and rock the probe around it in every direction for ~10 s (≥25° of rotation). Every pose satisfies `R·tip + t = pivot`, so least squares (with outlier rejection) recovers the real tip offset. It's saved to `configs/probe-tip.yaml`, used from then on, and the panel shows "tip: PIVOT".
+
+**Infrared detection (optional):** `probe.detect_on: infrared` detects tags in the D435's global-shutter IR image instead of the rolling-shutter colour image, which is sharper under fast motion. The projector alternates on/off per frame (60 fps capture → 30 fps depth + 30 fps clean IR, USB 3 only), and poses are mapped into the colour frame with the factory IR→colour extrinsics. The IR imager's wider field of view gives fewer pixels per tag, so colour stays the default: at ~1.2 m it detected fewer tags than colour here. Use infrared for close range or fast motion.
 
 The dashboard shows the Clarius model, the five textured tags on their faces, the cube axes, and the **red tip dot** (`probe.tip_in_object_m`, 192.5 mm along +Y) with a trail. It also reports the tip's XYZ above the floor and its distance to the nearest leg bone (thigh / shin / foot axis), drawn as a gold dashed line. The feeds show detected tag outlines and the projected tip.
+
+## Body pose across cameras
+
+With 2+ calibrated cameras, each joint whose 2D keypoint is confident in at least two views is **triangulated** from the rays rather than read from the depth map. Depth lookup fails when the joint is occluded (it hits whatever is in front) or sits at a silhouette edge. Views are chosen by consensus: every pair proposes a point, and the largest set that reprojects within 15 px wins, so one camera confusing left and right can't drag the result. A two-view point must also land within 30 cm of some camera's depth estimate. Joints seen by one camera keep the depth-based position. Body and probe run in separate loops, so the "nearest bone" distance uses the joints extrapolated to the probe frame's capture time.
+
+**Floor:** the lowest large horizontal surface in the world camera's cloud (seats and tables are horizontal too), tracked over time. A different plane replaces it only after three consistent fits, and it works with cameras looking steeply down (up to 75°).
 
 ## Configuration
 
@@ -97,22 +116,23 @@ src/vigil/
   rig.py                  multi-camera world frame, extrinsics file, rig calibration
   detector.py             transformers RT-DETR person detector
   detect_worker.py        detector in its own process (reads camera shared memory)
-  body.py                 body thread: tracking, batched pose, fusion, smoothing
+  body.py                 body thread: tracking, batched pose, multi-view triangulation, smoothing
   estimators/             sam3d_body.py, vitpose_depth.py (compiled, batched)
-  probe/                  ArUco detection, cube pose, filters (EKF/One Euro/Kalman), tracker
+  probe/                  ArUco detection, cube pose, per-view cleaning + joint solve (solver.py),
+                          pivot calibration (pivot.py), filters (EKF/One Euro/Kalman), tracker
   skeleton.py             canonical joints, bones, leg angles
-  geometry.py             depth sampling, deprojection, point cloud, floor RANSAC
+  geometry.py             depth sampling, deprojection, point cloud, floor detection
   filters.py              vectorised One Euro filter
   pipeline.py             camera-rate loop: probe, feeds, clouds, floor → websocket
   server.py               FastAPI app + websocket hub
   web/                    index.html, style.css, app.js (three.js from CDN)
 ```
 
-Websocket protocol: JSON `hello` / `status` / `calibration` / `frame` messages from the server, and `{"cmd": ...}` from the dashboard (`probe_filter`, `probe_reset`, `calibrate_rig`, `cancel_calibration`). Binary messages have an 8-byte header (`u8 kind, u8 camera, 2 pad, u32 seq`): kind 1 is mesh vertices (int16 mm), 2 is a JPEG preview, 3 is a point cloud (int16 mm xyz + rgb, in that camera's frame). Other coordinates are in the world frame: the first camera's color optical frame (x right, y down, z forward, metres).
+Websocket protocol: JSON `hello` / `status` / `calibration` / `frame` messages from the server, and `{"cmd": ...}` from the dashboard (`probe_filter`, `probe_reset`, `pivot_start`, `pivot_cancel`, `calibrate_rig`, `cancel_calibration`, `depth_range`). Binary messages have an 8-byte header (`u8 kind, u8 camera, 2 pad, u32 seq`): kind 1 is mesh vertices (int16 mm), 2 is a JPEG preview, 3 is a point cloud (int16 mm xyz + rgb, in that camera's frame). Other coordinates are in the world frame: the first camera's color optical frame (x right, y down, z forward, metres).
 
 ## Performance notes (RTX 3090, 848×480)
 
-Measured with two D435s (848×480 + 640×480) and the ViTPose backend: stream 30 fps, body 30 fps, about 35 ms latency.
+Measured with two D435s (both 848×480@30 on USB 3) and the ViTPose backend, probe in view of both: stream ≥ 29.9 fps (median 31.8), body 30.4 fps, probe tracking ~19 ms per frame for both cameras, paired-frame skew ~0.5 ms. Probe at rest: tip jitter 0.7 / 0.6 / 2.0 mm (x / y / z), joint-solve fit ~1.9 px, and the two cameras' independent poses agree to 3.6 mm / 1.1°.
 
 - librealsense's `align`/filters hold the Python GIL (about 8 ms per frame per camera), so capture runs in **one process per camera**. The spatial filter (15 ms) is off by default.
 - RT-DETR (about 45 ms, launch-bound) runs in **its own process**. The body loop never waits for it: it uses the newest matched box, or a box around the last keypoints.

@@ -18,7 +18,7 @@ from .detect_worker import DetectorProcess
 from .estimators import PoseEstimator, PoseResult
 from .filters import OneEuroFilter
 from .rig import Rig, RigCamera, transform
-from .skeleton import JOINT_INDEX, JOINTS, LEG_JOINTS, leg_angles
+from .skeleton import JOINT_INDEX, JOINTS, LEG_JOINTS, fill_derived, leg_angles
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +36,9 @@ class BodyState:
     fps: float = 0.0
     pose_ms: float = 0.0
     detection_age_ms: float | None = None
+    timestamp: float = 0.0  # capture time of the frames the joints came from
+    velocity: np.ndarray | None = None  # (J, 3) m/s, from the previous update
+    triangulated: int = 0  # joints placed by multi-view triangulation this update
 
 
 class BodyWorker:
@@ -94,8 +97,8 @@ class BodyWorker:
             frames[0] = f0
             for rc in cams:
                 if rc.index != 0:
-                    p = frames.get(rc.index)
-                    f = rc.camera.latest(p.index if p else -1, timeout=0.0)
+                    # Pair by capture time, so every view shows the same instant.
+                    f = rc.camera.paired(f0.timestamp)
                     if f is not None:
                         frames[rc.index] = f
             t0 = time.perf_counter()
@@ -179,7 +182,12 @@ class BodyWorker:
         return boxes[idx[np.argmin(dist[idx])]]
 
     def _fuse_and_smooth(self, results, timestamp: float) -> BodyState:
-        fused = fuse_people(results, self._prev_pelvis)
+        kept = agreeing_views(results, self._prev_pelvis)
+        fused = fuse_people(kept, None)
+        n_tri = 0
+        if fused is not None and self.cfg.estimator.triangulate and len(kept) >= 2:
+            fused, n_tri = triangulate_joints(fused, kept, self.cfg.estimator.triangulation_min_conf,
+                                              self.cfg.estimator.triangulation_max_px)
         if fused is None:
             self._joint_filter.reset()
             self._vert_filter.reset()
@@ -194,12 +202,30 @@ class BodyWorker:
         pelvis = joints[JOINT_INDEX["pelvis"]]
         self._prev_pelvis = pelvis[:3].copy() if pelvis[3] > 0 else None
         person = {
-            "cameras": [rc.index for rc, _ in results],
+            "cameras": [rc.index for rc, _ in kept],
             "joints": joints_json(joints),
             "angles": {k: (None if v is None else round(v, 1)) for k, v in leg_angles(joints).items()},
             "has_mesh": verts is not None,
+            "triangulated": n_tri,
         }
-        return BodyState(person=person, joints=joints, vertices=verts)
+        prev = self.state
+        velocity = None
+        if prev.joints is not None and 0 < timestamp - prev.timestamp < 0.2:
+            velocity = np.nan_to_num((joints[:, :3] - prev.joints[:, :3]) / (timestamp - prev.timestamp))
+        return BodyState(person=person, joints=joints, vertices=verts, timestamp=timestamp,
+                         velocity=velocity, triangulated=n_tri)
+
+    def joints_at(self, t: float) -> np.ndarray | None:
+        """Joints predicted at capture time `t` (e.g. a probe frame's), so body and probe are
+        compared at the same instant. Linear extrapolation, at most 100 ms."""
+        st = self.latest()
+        if st.joints is None:
+            return None
+        if st.velocity is None:
+            return st.joints
+        out = st.joints.copy()
+        out[:, :3] += st.velocity * float(np.clip(t - st.timestamp, -0.1, 0.1))
+        return out
 
 
 def _keypoint_box(kp2d: np.ndarray, min_conf: float = 0.3) -> np.ndarray | None:
@@ -235,25 +261,33 @@ def to_world(result: PoseResult, T: np.ndarray) -> PoseResult:
     return PoseResult(joints=joints, kp2d=result.kp2d, vertices=verts)
 
 
-def fuse_people(results: list[tuple[RigCamera, PoseResult]],
-                prev_pelvis: np.ndarray | None) -> PoseResult | None:
-    """Merge one person seen by several cameras (all in the world frame)."""
-    if not results:
-        return None
+def agreeing_views(results: list[tuple[RigCamera, PoseResult]],
+                   prev_pelvis: np.ndarray | None) -> list[tuple[RigCamera, PoseResult]]:
+    """The views that agree on where the subject is (pelvis ≤ 0.5 m apart)."""
+    if len(results) <= 1:
+        return results
     pel = JOINT_INDEX["pelvis"]
 
     def pelvis(r: PoseResult):
         return r.joints[pel, :3] if r.joints[pel, 3] > 0 else None
 
-    # Keep the views that agree on where the subject is (≤ 0.5 m apart).
     anchor = prev_pelvis
     if anchor is None:
         anchor = next((pelvis(r) for _, r in results if pelvis(r) is not None), None)
-    if anchor is not None:
-        agree = [(rc, r) for rc, r in results
-                 if pelvis(r) is None or np.linalg.norm(pelvis(r) - anchor) < 0.5]
-        results = agree or [min(results, key=lambda x: np.linalg.norm(
-            (pelvis(x[1]) if pelvis(x[1]) is not None else np.full(3, 1e3)) - anchor))]
+    if anchor is None:
+        return results
+    agree = [(rc, r) for rc, r in results
+             if pelvis(r) is None or np.linalg.norm(pelvis(r) - anchor) < 0.5]
+    return agree or [min(results, key=lambda x: np.linalg.norm(
+        (pelvis(x[1]) if pelvis(x[1]) is not None else np.full(3, 1e3)) - anchor))]
+
+
+def fuse_people(results: list[tuple[RigCamera, PoseResult]],
+                prev_pelvis: np.ndarray | None) -> PoseResult | None:
+    """Merge one person seen by several cameras (all in the world frame)."""
+    results = agreeing_views(results, prev_pelvis)
+    if not results:
+        return None
     if len(results) == 1:
         return results[0][1]
 
@@ -267,6 +301,104 @@ def fuse_people(results: list[tuple[RigCamera, PoseResult]],
     legs = [JOINT_INDEX[j] for j in LEG_JOINTS]
     best = max(results, key=lambda x: float(x[1].joints[legs, 3].sum()))[1]
     return PoseResult(joints=joints, kp2d=best.kp2d, vertices=best.vertices)
+
+
+def triangulate_joints(fused: PoseResult, views: list[tuple[RigCamera, PoseResult]],
+                       min_conf: float = 0.4, max_px: float = 15.0,
+                       max_depth_disagreement_m: float = 0.3) -> tuple[PoseResult, int]:
+    """Replace depth-lifted joints with multi-view triangulation where 2+ cameras see them.
+
+    Depth lifting samples the depth map at the keypoint, which fails when the joint is
+    occluded (depth hits whatever is in front) or at silhouette edges; rays from calibrated
+    cameras don't. Each triangulated joint must reproject within `max_px` in every view used.
+    """
+    import cv2
+
+    Ps, uvs, confs = [], [], []
+    for rc, r in views:
+        K = rc.camera.intrinsics
+        Km = K.matrix().astype(np.float64)
+        T_cw = np.linalg.inv(rc.T_world_camera)
+        Ps.append((Km, K.dist_coeffs(), T_cw))
+        uvs.append(r.kp2d[:, :2].astype(np.float64))
+        confs.append(r.kp2d[:, 2])
+    joints = fused.joints.copy()
+    n_done = 0
+    for j in range(len(joints)):
+        cand = [i for i in range(len(views)) if confs[i][j] >= min_conf]
+        use = _consensus(j, cand, Ps, uvs, confs, max_px)
+        if len(use) < 2:
+            continue
+        X, errs = _dlt(j, use, Ps, uvs, confs)
+        if X is None or max(errs) > max_px:
+            continue
+        # Two views can't expose a wrong correspondence (e.g. swapped knees still give rays
+        # that nearly meet — at the wrong place). Require agreement with at least one view's
+        # depth-based estimate; an occluded joint still passes via the unoccluded camera.
+        lifted = [r.joints[j, :3] for _, r in views if r.joints[j, 3] > 0 and np.isfinite(r.joints[j, 0])]
+        if lifted and min(np.linalg.norm(X - q) for q in lifted) > max_depth_disagreement_m:
+            continue
+        joints[j] = (*X, float(np.mean([confs[i][j] for i in use])))
+        n_done += 1
+    fill_derived(joints)
+    return PoseResult(joints=joints, kp2d=fused.kp2d, vertices=fused.vertices), n_done
+
+
+def _consensus(j, cand, Ps, uvs, confs, max_px):
+    """Largest set of views that agree on joint j. A single bad view (e.g. left/right
+    swapped) drags a least-squares point towards itself and makes *good* views look worst,
+    so hypothesise from every pair and keep the pair whose point most views agree with."""
+    if len(cand) <= 2:
+        return cand
+    best = []
+    for a in range(len(cand)):
+        for b in range(a + 1, len(cand)):
+            X, _ = _dlt(j, [cand[a], cand[b]], Ps, uvs, confs)
+            if X is None:
+                continue
+            inliers = [i for i in cand if _reproj(X, i, j, Ps, uvs) <= max_px]
+            if len(inliers) > len(best):
+                best = inliers
+    return best
+
+
+def _reproj(X, i, j, Ps, uvs):
+    import cv2
+
+    Km, dist, T_cw = Ps[i]
+    Xc = T_cw[:3, :3] @ X + T_cw[:3, 3]
+    if Xc[2] <= 0.05:
+        return np.inf
+    uv, _ = cv2.projectPoints(Xc.reshape(1, 3), np.zeros(3), np.zeros(3), Km, dist)
+    return float(np.linalg.norm(uv.reshape(2) - uvs[i][j]))
+
+
+def _dlt(j, use, Ps, uvs, confs):
+    import cv2
+
+    A = []
+    for i in use:
+        Km, dist, T_cw = Ps[i]
+        # Undistort to normalised coordinates, then project with [R|t] only.
+        xn = cv2.undistortPoints(uvs[i][j].reshape(1, 1, 2), Km, dist).reshape(2)
+        P = T_cw[:3]
+        w = float(confs[i][j])
+        A.append(w * (xn[0] * P[2] - P[0]))
+        A.append(w * (xn[1] * P[2] - P[1]))
+    _, _, vt = np.linalg.svd(np.asarray(A))
+    Xh = vt[-1]
+    if abs(Xh[3]) < 1e-9:
+        return None, []
+    X = Xh[:3] / Xh[3]
+    errs = []
+    for i in use:
+        Km, dist, T_cw = Ps[i]
+        Xc = T_cw[:3, :3] @ X + T_cw[:3, 3]
+        if Xc[2] <= 0.05:
+            return None, []
+        uv, _ = cv2.projectPoints(Xc.reshape(1, 3), np.zeros(3), np.zeros(3), Km, dist)
+        errs.append(float(np.linalg.norm(uv.reshape(2) - uvs[i][j])))
+    return X, errs
 
 
 def joints_json(joints: np.ndarray) -> dict[str, list[float]]:

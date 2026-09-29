@@ -52,24 +52,21 @@ def point_cloud(
 def fit_floor(
     xyz: np.ndarray,
     max_tilt_deg: float,
-    iters: int = 300,
+    iters: int = 400,
     inlier_m: float = 0.03,
     rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, float] | None:
-    """RANSAC the dominant roughly-horizontal plane below the camera.
+    """RANSAC the floor: the lowest well-supported roughly-horizontal plane below the camera.
 
     Returns (n, d) with unit n pointing up (towards the camera side) and n·p + d = 0,
     so d is the camera height above the floor. None if no plausible floor is found.
+    Seats and tables are horizontal too, so among parallel planes the lowest one with
+    substantial support wins, not simply the one with the most points.
     """
     if len(xyz) < 500:
         return None
     rng = rng or np.random.default_rng()
-    # Only points below the optical axis can be floor (camera y points down).
-    cand = xyz[xyz[:, 1] > 0.1]
-    if len(cand) < 300:
-        return None
-    if len(cand) > 8000:
-        cand = cand[rng.choice(len(cand), 8000, replace=False)]
+    cand = xyz if len(xyz) <= 8000 else xyz[rng.choice(len(xyz), 8000, replace=False)]
 
     tri = cand[rng.integers(0, len(cand), size=(iters, 3))]
     n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
@@ -92,12 +89,48 @@ def fit_floor(
     best = int(np.argmax(counts))
     if counts[best] < 0.05 * len(cand):
         return None
+    # Parallel planes (within 8°) with at least a quarter of the best support: take the lowest.
+    parallel = (n @ n[best] > np.cos(np.radians(8))) & (counts >= 0.25 * counts[best])
+    pick = int(np.flatnonzero(parallel)[np.argmax(d[parallel])])
 
     # Least-squares refinement on the inliers.
-    inl = cand[np.abs(cand @ n[best] + d[best]) < inlier_m]
+    inl = cand[np.abs(cand @ n[pick] + d[pick]) < inlier_m]
     centroid = inl.mean(axis=0)
     _, _, vt = np.linalg.svd(inl - centroid, full_matrices=False)
     normal = vt[-1]
     if normal[1] > 0:
         normal = -normal
     return normal.astype(np.float32), float(-normal @ centroid)
+
+
+class FloorEstimate:
+    """Temporally stable floor: fits that agree with the current plane are blended in; a
+    different plane replaces it only after showing up in several consecutive fits (so one
+    fit that grabbed a seat or table never gets averaged into the floor)."""
+
+    def __init__(self, confirm: int = 3, max_deg: float = 5.0, max_m: float = 0.05):
+        self.plane: tuple[np.ndarray, float] | None = None
+        self.confirm, self.max_deg, self.max_m = confirm, max_deg, max_m
+        self._pending: list[tuple[np.ndarray, float]] = []
+
+    def _same(self, a, b) -> bool:
+        return (float(a[0] @ b[0]) > np.cos(np.radians(self.max_deg))
+                and abs(a[1] - b[1]) < self.max_m)
+
+    def update(self, fit: tuple[np.ndarray, float] | None) -> tuple[np.ndarray, float] | None:
+        if fit is None:
+            return self.plane
+        if self.plane is None or self._same(fit, self.plane):
+            self._pending.clear()
+            if self.plane is None:
+                self.plane = fit
+            else:
+                n = 0.7 * self.plane[0] + 0.3 * fit[0]
+                self.plane = (n / np.linalg.norm(n), 0.7 * self.plane[1] + 0.3 * fit[1])
+            return self.plane
+        if self._pending and not self._same(fit, self._pending[-1]):
+            self._pending.clear()
+        self._pending.append(fit)
+        if len(self._pending) >= self.confirm:
+            self.plane, self._pending = self._pending[-1], []
+        return self.plane
