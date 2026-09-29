@@ -91,6 +91,7 @@ class SceneConfig(_Strict):
     point_cloud: bool = True
     point_cloud_stride: int = 4
     point_cloud_every_n: int = 2
+    fused_voxel_m: float = 0.01
     floor_detection: bool = True
     floor_max_tilt_deg: float = 50.0
     floor_every_n: int = 15

@@ -121,7 +121,7 @@ class Rig:
             self._ref_T[serial] = self._ref_T[w] @ T_world_camera
         else:
             self._ref, self._ref_T, self._meta = w, {w: np.eye(4), serial: T_world_camera}, {}
-        self._meta[serial] = meta
+        self._meta[serial] = {k: v.item() if isinstance(v, np.generic) else v for k, v in meta.items()}
         self._apply()
         self._save()
 
@@ -215,8 +215,8 @@ class RigCalibrator:
             # Per-frame scatter, and the standard error of the averaged extrinsic.
             "spread_mm": round(spread_mm, 2),
             "spread_deg": round(rot_spread, 3),
-            "stderr_mm": round(spread_mm / np.sqrt(n), 2),
-            "stderr_deg": round(rot_spread / np.sqrt(n), 3),
+            "stderr_mm": round(float(spread_mm / np.sqrt(n)), 2),
+            "stderr_deg": round(float(rot_spread / np.sqrt(n)), 3),
             "calibrated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         return to_h(R_mean, t_mean), meta

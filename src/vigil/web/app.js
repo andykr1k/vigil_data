@@ -10,6 +10,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // Binary messages: u8 kind, u8 camera, 2 pad, u32 seq (must match pipeline.py).
 const MSG_MESH = 1, MSG_JPEG = 2, MSG_CLOUD = 3;
+const FUSED = 255; // camera index of the fused world-frame cloud
 
 const COLORS = {
   left: new THREE.Color("#22e4ff"),
@@ -199,7 +200,7 @@ scene.add(dust);
 
 // ───────────────────────────── cameras (rig) ─────────────────────────────
 const CLOUD_MAX = 200_000;
-let rigCams = []; // per camera: { info, group, cloudGeo, feed, image }
+let rigCams = []; // per camera: { info, group, cloud, feed, image }
 
 function makeSensorGlyph(cam, highlight, calibrated) {
   const color = !calibrated ? "#ffc53d" : highlight ? "#22e4ff" : "#7d8cff";
@@ -239,17 +240,10 @@ function buildRig(cameras) {
     else group.matrix.makeTranslation(0.35 * cam.index, 0, 0);
     group.add(makeSensorGlyph(cam, cam.index === 0, calibrated));
 
-    const cloudGeo = new THREE.BufferGeometry();
-    cloudGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(CLOUD_MAX * 3), 3).setUsage(THREE.DynamicDrawUsage));
-    cloudGeo.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(CLOUD_MAX * 3), 3, true).setUsage(THREE.DynamicDrawUsage));
-    cloudGeo.setDrawRange(0, 0);
-    const cloud = new THREE.Points(cloudGeo, new THREE.PointsMaterial({
-      size: 0.014, vertexColors: true, transparent: true, opacity: 0.8, depthWrite: false,
-      // Real colours, muted behind the subject; amber-tinted while the pose is a placeholder.
-      color: calibrated ? new THREE.Color(0.32, 0.4, 0.48) : new THREE.Color(0.55, 0.42, 0.18),
-    }));
-    cloud.frustumCulled = false;
-    cloud.visible = opts.cloud;
+    // Calibrated cameras feed the single fused cloud; only an uncalibrated camera draws its
+    // own (amber-tinted) cloud at its placeholder pose.
+    const cloud = makeCloud(new THREE.Color(0.55, 0.42, 0.18));
+    cloud.visible = opts.cloud && !calibrated;
     group.add(cloud);
     sensorRoot.add(group);
 
@@ -259,7 +253,7 @@ function buildRig(cameras) {
     feeds.appendChild(wrap);
     const feed = wrap.querySelector("canvas");
     feed.style.aspectRatio = `${cam.width} / ${cam.height}`;
-    return { info: cam, group, cloud, cloudGeo, feed, ctx: feed.getContext("2d"), image: null };
+    return { info: cam, group, cloud, feed, ctx: feed.getContext("2d"), image: null };
   });
   renderRigList();
   const views = $("view-cams");
@@ -273,18 +267,33 @@ function buildRig(cameras) {
   }
 }
 
+function makeCloud(color) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(CLOUD_MAX * 3), 3).setUsage(THREE.DynamicDrawUsage));
+  geo.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(CLOUD_MAX * 3), 3, true).setUsage(THREE.DynamicDrawUsage));
+  geo.setDrawRange(0, 0);
+  const cloud = new THREE.Points(geo, new THREE.PointsMaterial({
+    size: 0.014, vertexColors: true, transparent: true, opacity: 0.8, depthWrite: false, color }));
+  cloud.frustumCulled = false;
+  return cloud;
+}
+// Every calibrated camera merged into one cloud, already in the world frame.
+const fusedCloud = makeCloud(new THREE.Color(0.32, 0.4, 0.48));
+sensorRoot.add(fusedCloud);
+
 function onCloud(cam, buf) {
-  const rc = rigCams[cam];
-  if (!rc) return;
+  const cloud = cam === FUSED ? fusedCloud : rigCams[cam]?.cloud;
+  if (!cloud) return;
+  const geo = cloud.geometry;
   const n = Math.min(new DataView(buf).getUint32(8, true), CLOUD_MAX);
   const xyz = new Int16Array(buf, 12, n * 3);
   const rgb = new Uint8Array(buf, 12 + n * 6, n * 3);
-  const pos = rc.cloudGeo.attributes.position.array, col = rc.cloudGeo.attributes.color.array;
+  const pos = geo.attributes.position.array, col = geo.attributes.color.array;
   for (let i = 0; i < n * 3; i++) pos[i] = xyz[i] * 0.001;
   col.set(rgb);
-  rc.cloudGeo.attributes.position.needsUpdate = true;
-  rc.cloudGeo.attributes.color.needsUpdate = true;
-  rc.cloudGeo.setDrawRange(0, n);
+  geo.attributes.position.needsUpdate = true;
+  geo.attributes.color.needsUpdate = true;
+  geo.setDrawRange(0, n);
 }
 
 // ───────────────────────────── hologram mesh ─────────────────────────────
@@ -588,6 +597,7 @@ function updateProbe(probe) {
   panel.textContent = probe.tracked ? "TRACKED" : "SEARCHING";
   panel.style.color = probe.tracked ? "var(--ok)" : "var(--warn)";
 
+  probeState.tracked = probe.tracked;
   if (!probe.tracked) {
     nearestLine.visible = false;
     return;
@@ -907,7 +917,8 @@ $("view-top").onclick = () => setView("top");
 setView("reset");
 
 function applyVisibility() {
-  for (const rc of rigCams) rc.cloud.visible = opts.cloud;
+  fusedCloud.visible = opts.cloud;
+  for (const rc of rigCams) rc.cloud.visible = opts.cloud && !rc.info.T_world_camera;
   floor.visible = opts.grid;
   footTrails.left.line.visible = footTrails.right.line.visible = opts.trails;
   tipTrail.line.visible = opts.tiptrail && opts.probe;
@@ -1004,7 +1015,8 @@ function tick() {
   holo.visible = u.value > 0.01;
 
   // The probe is always shown: solid while tracked, ghosted at its last pose otherwise.
-  const probeFresh = probeState.lastSeen > 0 && performance.now() - probeState.lastSeen < 500;
+  // Live = the newest frame says tracked (and frames are still arriving).
+  const probeFresh = !!probeState.tracked && performance.now() - probeState.lastSeen < 1500;
   probeGroup.visible = opts.probe && !!probeState.info;
   setProbeLive(probeFresh);
   if (probeState.tipLabel) {

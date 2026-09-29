@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 
 # Binary websocket messages: 8-byte header (u8 kind, u8 camera index, 2 pad, u32 seq).
 MSG_MESH, MSG_JPEG, MSG_CLOUD = 1, 2, 3
+FUSED = 255  # camera index of the fused (world-frame) cloud
 
 # Leg segments the probe tip is measured against.
 LEG_SEGMENTS = {
@@ -201,21 +202,33 @@ class Pipeline:
                 probe, cam_poses = self._track_probe(rig, frames, fresh, tracker, views,
                                                      time.monotonic(), state.joints)
                 if calibrator is not None:
-                    calibrator.add(rig.world.serial, cam_poses)
-                    calibrator = self._check_calibration(rig, calibrator, backend, tracker)
+                    try:
+                        calibrator.add(rig.world.serial, cam_poses)
+                        calibrator = self._check_calibration(rig, calibrator, backend, tracker)
+                    except Exception as e:  # a failed calibration must not stop streaming
+                        log.error("rig calibration failed:\n%s", traceback.format_exc())
+                        self._calibration_result("failed", f"Calibration error: {type(e).__name__}: {e}")
+                        calibrator = None
             probe_ms = (time.perf_counter() - t0) * 1000
 
             for rc in rig.cameras:
                 if fresh[rc.index]:
                     binaries.append(_pack(MSG_JPEG, rc.index, seq,
                                           self._preview(frames[rc.index].color)))
-            # Clouds are the heaviest payload; cameras take turns. Uncalibrated cameras send
-            # theirs too: the dashboard shows them at a placeholder pose until calibrated.
+            # One fused cloud from every calibrated camera (world frame, de-duplicated);
+            # uncalibrated cameras take turns sending their own until they're placed.
             if sc.point_cloud and seq % sc.point_cloud_every_n == 0:
-                rc = rig.cameras[(seq // sc.point_cloud_every_n) % n]
-                if frames[rc.index] is not None:
+                calibrated = [rc for rc in rig.cameras if rc.calibrated and frames[rc.index] is not None]
+                loose = [rc for rc in rig.cameras if not rc.calibrated and frames[rc.index] is not None]
+                tick = seq // sc.point_cloud_every_n
+                if loose and tick % 2:
+                    rc = loose[(tick // 2) % len(loose)]
                     xyz, rgb = self._cloud(frames[rc.index], rc)
                     binaries.append(_pack(MSG_CLOUD, rc.index, seq,
+                                          struct.pack("<I", len(xyz)) + _mm(xyz) + rgb.tobytes()))
+                elif calibrated:
+                    xyz, rgb = self._fused_cloud(frames, calibrated)
+                    binaries.append(_pack(MSG_CLOUD, FUSED, seq,
                                           struct.pack("<I", len(xyz)) + _mm(xyz) + rgb.tobytes()))
             if sc.floor_detection and (floor is None or seq % sc.floor_every_n == 0):
                 xyz, _ = self._cloud(frames[0], rig.world)
@@ -358,6 +371,13 @@ class Pipeline:
         return point_cloud(frame.color, frame.depth, rc.camera.intrinsics,
                            sc.point_cloud_stride, c.depth_min_m, c.depth_max_m)
 
+    def _fused_cloud(self, frames, cams: list[RigCamera]) -> tuple[np.ndarray, np.ndarray]:
+        """All calibrated cameras' clouds in the world frame, one point per voxel."""
+        parts = [self._cloud(frames[rc.index], rc) for rc in cams]
+        xyz = np.concatenate([transform(rc.T_world_camera, p[0]) for rc, p in zip(cams, parts)])
+        rgb = np.concatenate([p[1] for p in parts])
+        return voxel_dedupe(xyz.astype(np.float32), rgb, self.cfg.scene.fused_voxel_m)
+
     def _preview(self, rgb: np.ndarray) -> bytes:
         s = self.cfg.server
         h, w = rgb.shape[:2]
@@ -366,6 +386,18 @@ class Pipeline:
         ok, buf = cv2.imencode(".jpg", small[:, :, ::-1],
                                [cv2.IMWRITE_JPEG_QUALITY, s.preview_jpeg_quality])
         return buf.tobytes() if ok else b""
+
+
+def voxel_dedupe(xyz: np.ndarray, rgb: np.ndarray, voxel: float) -> tuple[np.ndarray, np.ndarray]:
+    """Keep one point per voxel so overlapping cameras don't double the density."""
+    if len(xyz) == 0:
+        return xyz, rgb
+    q = np.floor(xyz / voxel).astype(np.int64)
+    q -= q.min(0)
+    dims = q.max(0) + 1
+    keys = (q[:, 0] * dims[1] + q[:, 1]) * dims[2] + q[:, 2]
+    _, first = np.unique(keys, return_index=True)
+    return xyz[first], rgb[first]
 
 
 def _nearest_segment(tip: np.ndarray, joints: np.ndarray | None) -> dict | None:

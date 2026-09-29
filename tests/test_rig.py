@@ -159,3 +159,38 @@ def test_keypoint_box_follows_confident_keypoints():
     box = _keypoint_box(kp)
     np.testing.assert_allclose(box, [90, 14, 210, 446])
     assert _keypoint_box(np.zeros((21, 3), np.float32)) is None
+
+
+def test_real_calibration_metadata_saves_and_reloads(tmp_path):
+    """Regression: numpy scalars in the solved metadata crashed yaml.safe_dump."""
+    import yaml
+
+    cal = RigCalibrator(target=20)
+    T = to_h(rot([0.2, -0.3, 0.1]), np.array([0.0, 0.1, 1.4]))
+    for _ in range(30):
+        cal.add("world", cube_views(T, noise_m=0.001, noise_deg=0.2))
+    T_est, meta = cal.solve("cam2")
+
+    rig = Rig.__new__(Rig)
+    rig.extrinsics_path = tmp_path / "extrinsics.yaml"
+    rig._ref, rig._ref_T, rig._meta = None, {}, {}
+
+    class Cam:
+        def __init__(self, serial):
+            self.serial, self.T_world_camera = serial, None
+
+    rig.cameras = [Cam("A"), Cam("B")]
+    rig.cameras[0].T_world_camera = np.eye(4)
+    rig.set_extrinsic("B", T_est, meta)
+    saved = yaml.safe_load(rig.extrinsics_path.read_text())
+    assert saved["cameras"]["B"]["samples"] == meta["samples"]
+    assert isinstance(saved["cameras"]["B"]["stderr_mm"], float)
+
+
+def test_voxel_dedupe_merges_overlapping_points():
+    from vigil.pipeline import voxel_dedupe
+
+    a = np.array([[0.001, 0.0, 1.0], [0.004, 0.002, 1.003], [0.5, 0.0, 1.0]], np.float32)
+    rgb = np.array([[1, 1, 1], [2, 2, 2], [3, 3, 3]], np.uint8)
+    xyz, col = voxel_dedupe(a, rgb, 0.01)
+    assert len(xyz) == 2 and len(col) == 2
