@@ -49,19 +49,9 @@ def connected_serials() -> list[str]:
 class RealSenseCamera:
     """Streams aligned frames; `latest()` always returns the newest one (older ones are dropped)."""
 
-    def __init__(self, cfg: CamerasConfig, serial: str, sync_role: int = 0,
-                 infrared: bool = False):
+    def __init__(self, cfg: CamerasConfig, serial: str):
         self.cfg = cfg
         self.serial = serial
-        # Infrared mode: also stream the left IR camera and alternate the depth projector
-        # on/off per frame. Projector-on frames feed depth + colour; projector-off frames give
-        # clean, global-shutter IR images for tag detection. Needs the 60 fps modes (USB 3).
-        self.want_infrared = infrared
-        self.infrared = False
-        self.ir_intrinsics: Intrinsics | None = None
-        self.T_color_ir: np.ndarray | None = None
-        self._latest_ir: tuple[np.ndarray, float, int] | None = None
-        self.sync_role = sync_role  # inter_cam_sync_mode: 0 default, 1 master, 2 slave
         self.state = "ok"  # ok | reconnecting
         self.generation = 0  # bumps on every (re)start; intrinsics/mode may change
         self.pipeline = rs.pipeline()
@@ -88,26 +78,14 @@ class RealSenseCamera:
         if device is None:
             raise RuntimeError(f"RealSense {self.serial} not connected")
         usb = device.get_info(rs.camera_info.usb_type_descriptor)
-        if self.sync_role:
-            sensor = device.first_depth_sensor()
-            if sensor.supports(rs.option.inter_cam_sync_mode):
-                sensor.set_option(rs.option.inter_cam_sync_mode, self.sync_role)
-            else:
-                log.warning("RealSense %s: hardware sync not supported", self.serial)
-        # A USB 2 link can't reliably carry the USB 3 modes (or infrared mode).
-        infrared = self.want_infrared and not usb.startswith("2")
-        if self.want_infrared and not infrared:
-            log.warning("RealSense %s: infrared tag detection needs USB 3; using colour", self.serial)
-        modes = (self.cfg.infrared_modes if infrared
-                 else self.cfg.usb2_modes if usb.startswith("2") else self.cfg.modes)
+        # A USB 2 link can't reliably carry the USB 3 modes.
+        modes = self.cfg.usb2_modes if usb.startswith("2") else self.cfg.modes
         errors = []
         for width, height, fps in modes:
             rs_cfg = rs.config()
             rs_cfg.enable_device(self.serial)
             rs_cfg.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)
             rs_cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
-            if infrared:
-                rs_cfg.enable_stream(rs.stream.infrared, 1, width, height, rs.format.y8, fps)
             try:
                 profile = self.pipeline.start(rs_cfg)
                 break
@@ -122,43 +100,14 @@ class RealSenseCamera:
         self.name = device.get_info(rs.camera_info.name)
         self.usb = device.get_info(rs.camera_info.usb_type_descriptor)
         self.depth_scale = device.first_depth_sensor().get_depth_scale()
+        self._set_exposure(device)
         color_intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
         self.intrinsics = Intrinsics(
             color_intr.width, color_intr.height,
             color_intr.fx, color_intr.fy, color_intr.ppx, color_intr.ppy,
             tuple(float(c) for c in color_intr.coeffs),
         )
-        self.infrared = False
-        if infrared:
-            depth_sensor = device.first_depth_sensor()
-            if depth_sensor.supports(rs.option.emitter_on_off):
-                depth_sensor.set_option(rs.option.emitter_on_off, 1)
-                ir = profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
-                ii = ir.get_intrinsics()
-                self.ir_intrinsics = Intrinsics(ii.width, ii.height, ii.fx, ii.fy, ii.ppx, ii.ppy,
-                                                tuple(float(c) for c in ii.coeffs))
-                ex = ir.get_extrinsics_to(profile.get_stream(rs.stream.color))
-                T = np.eye(4)
-                T[:3, :3] = np.asarray(ex.rotation).reshape(3, 3).T  # librealsense: column-major
-                T[:3, 3] = ex.translation
-                self.T_color_ir = T
-                self.infrared = True
-            else:
-                log.warning("RealSense %s: firmware can't alternate the emitter; using colour", self.serial)
         self.generation += 1
-
-    def _emitter_off(self, frames) -> bool | None:
-        """True for a projector-off frame (clean IR), None if the camera can't tell us."""
-        ir = frames.get_infrared_frame(1)
-        md = rs.frame_metadata_value.frame_laser_power_mode
-        if not ir or not ir.supports_frame_metadata(md):
-            return None
-        return ir.get_frame_metadata(md) == 0
-
-    def latest_ir(self) -> tuple[np.ndarray, float, int] | None:
-        """Newest projector-off IR image (gray), its capture time, and index."""
-        with self._cond:
-            return self._latest_ir
 
     def _run(self) -> None:
         # Only grab raw framesets here: wait_for_frames releases the GIL, but librealsense
@@ -175,23 +124,27 @@ class RealSenseCamera:
                     misses = 0
                 continue
             misses = 0
-            if self.infrared:
-                off = self._emitter_off(frames)
-                if off is None:
-                    log.warning("RealSense %s: no emitter metadata; infrared detection disabled",
-                                self.serial)
-                    self.infrared = False
-                elif off:
-                    ir = np.asanyarray(frames.get_infrared_frame(1).get_data()).copy()
-                    with self._cond:
-                        self._latest_ir = (ir, self._timestamp(frames), index)
-                    index += 1
-                    continue  # projector off: no usable depth in this frame
             frames.keep()
             with self._cond:
                 self._latest = (frames, self._timestamp(frames), index)
                 self._cond.notify_all()
             index += 1
+
+    def _set_exposure(self, device) -> None:
+        """Short fixed colour exposure: auto-exposure picks ~17 ms indoors, long enough to
+        smear a moving tag across several of its ~3 px code cells."""
+        ms = self.cfg.color_exposure_ms
+        color = next((s for s in device.query_sensors()
+                      if s.supports(rs.option.exposure) and s.is_color_sensor()), None)
+        if color is None:
+            return
+        if ms is None:
+            color.set_option(rs.option.enable_auto_exposure, 1)
+            return
+        color.set_option(rs.option.enable_auto_exposure, 0)
+        color.set_option(rs.option.exposure, float(ms) * 10)  # units of 0.1 ms
+        if self.cfg.color_gain is not None:
+            color.set_option(rs.option.gain, float(self.cfg.color_gain))
 
     def _timestamp(self, frames) -> float:
         """Capture time in seconds on the host clock.

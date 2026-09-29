@@ -22,7 +22,6 @@ from .filtering.pose import FILTER_METHODS, ObjectPoseFilter
 from .filtering.presets import load_filter_preset_file
 from .geometry import ProbeGeometry
 from .object_pose import ObjectPose, mean_rotation
-from .pivot import load_tip
 from .solver import CameraView, CleanView, Refined, clean_view, refine_multiview
 
 log = logging.getLogger(__name__)
@@ -33,23 +32,20 @@ class ProbeInput:
     """One camera's contribution for a frame."""
 
     serial: str
-    T_world_cam: np.ndarray | None  # colour camera → world; None for an uncalibrated camera
-    K: np.ndarray  # intrinsics of the image the tags are detected in
+    T_world_cam: np.ndarray | None  # camera → world; None for an uncalibrated camera
+    K: np.ndarray
     dist: np.ndarray
-    image: np.ndarray  # RGB colour image, or gray projector-off IR image
-    depth: np.ndarray | None  # aligned to `image` (None for IR: not aligned to it)
-    T_cam_img: np.ndarray | None = None  # image sensor → colour camera frame (IR: T_color_ir)
-    source: str = "color"
+    image: np.ndarray  # RGB
+    depth: np.ndarray | None  # metres, aligned to the image
 
 
 @dataclass
 class ProbeFrame:
     estimate: ObjectPose | None  # filtered, world frame
     measured: ObjectPose | None  # unfiltered joint solve, world frame
-    views: dict[str, CleanView] = field(default_factory=dict)  # per camera, image-sensor frame
-    cam_poses: dict[str, ObjectPose] = field(default_factory=dict)  # per camera, colour frame
+    views: dict[str, CleanView] = field(default_factory=dict)  # per camera
+    cam_poses: dict[str, ObjectPose] = field(default_factory=dict)  # per camera, camera frame
     world_poses: dict[str, ObjectPose] = field(default_factory=dict)  # per calibrated camera
-    sources: dict[str, str] = field(default_factory=dict)  # "color" / "infrared" per camera
     refined: Refined | None = None
 
 
@@ -67,12 +63,7 @@ class ProbeTracker:
     def __init__(self, cfg: Config):
         pc = cfg.probe
         self.cfg = pc
-        self.cad_tip = np.asarray(pc.tip_in_object_m, dtype=np.float64)
-        self.tip_path = cfg.resolve(pc.tip_calibration_path)
-        tip = load_tip(self.tip_path)
-        self.tip_source = "pivot calibration" if tip is not None else "CAD"
-        self.geometry = ProbeGeometry.clarius(pc.marker_length_m, pc.cube_size_m,
-                                              tuple(tip if tip is not None else self.cad_tip))
+        self.geometry = ProbeGeometry.clarius(pc.marker_length_m, pc.cube_size_m, pc.tip_in_object_m)
         self._local = threading.local()
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="aruco")
         self._frame = 0
@@ -102,8 +93,7 @@ class ProbeTracker:
         """Image window around the last known cube position (None → search the full frame)."""
         if self._last is None or c.T_world_cam is None or self._frame % 15 == 0:
             return None  # also a periodic full-frame pass, in case the ROI locked onto a stale spot
-        T_wi = c.T_world_cam @ (np.eye(4) if c.T_cam_img is None else c.T_cam_img)
-        T_io = np.linalg.inv(T_wi) @ _to_h(self._last)
+        T_io = np.linalg.inv(c.T_world_cam) @ _to_h(self._last)
         # The cube's 8 corners (±half size) projected into this image, padded.
         h = np.asarray(self.geometry.cube_size) / 2
         box = np.array([[sx * h[0], sy * h[1], sz * h[2]] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)])
@@ -120,10 +110,6 @@ class ProbeTracker:
         if x1 - x0 < 32 or y1 - y0 < 32 or (x1 - x0) * (y1 - y0) > 0.6 * W * H:
             return None
         return x0, y0, x1, y1
-
-    def set_tip(self, tip: np.ndarray, source: str) -> None:
-        self.geometry = dataclasses.replace(self.geometry, tip=tuple(float(v) for v in tip))
-        self.tip_source = source
 
     def detect(self, image: np.ndarray, K: np.ndarray, dist: np.ndarray,
                offset: tuple[int, int] = (0, 0)) -> list[DetectedMarkerPose]:
@@ -150,10 +136,8 @@ class ProbeTracker:
                               self._pool.map(self._detect_input, inputs)))
         self._frame += 1
 
-        def T_wi(c):  # image sensor → world (None if the camera isn't calibrated)
-            if c.T_world_cam is None:
-                return None
-            return c.T_world_cam @ (np.eye(4) if c.T_cam_img is None else c.T_cam_img)
+        def T_wi(c):  # camera → world (None if the camera isn't calibrated)
+            return c.T_world_cam
 
         def solve(c, reference):
             T = T_wi(c)
@@ -179,20 +163,17 @@ class ProbeTracker:
         for c in inputs:
             view = views[c.serial]
             out.views[c.serial] = view
-            out.sources[c.serial] = c.source
             if view.pose is None:
                 continue
             ids = view.pose.marker_ids
-            T_ci = np.eye(4) if c.T_cam_img is None else c.T_cam_img
-            out.cam_poses[c.serial] = _from_h(T_ci @ _to_h(view.pose), ids)
+            out.cam_poses[c.serial] = view.pose
             if T_wi(c) is not None:
                 out.world_poses[c.serial] = _from_h(T_wi(c) @ _to_h(view.pose), ids)
 
         init = fuse_poses(list(out.world_poses.values()))
         measured = init
         if init is not None and self.cfg.joint_solve:
-            views = [CameraView(c.T_world_cam @ (np.eye(4) if c.T_cam_img is None else c.T_cam_img),
-                                c.K, c.dist, out.views[c.serial].markers,
+            views = [CameraView(c.T_world_cam, c.K, c.dist, out.views[c.serial].markers,
                                 c.depth if self.cfg.use_depth else None)
                      for c in inputs
                      if c.T_world_cam is not None and c.serial in out.world_poses]

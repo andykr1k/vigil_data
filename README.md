@@ -53,11 +53,11 @@ Every connected RealSense is used (or the `cameras.serials` list). The first ser
 2. Press **CALIBRATE RIG** (top-right RIG panel).
 3. Keep it still at a spot for a second or two, then move to a new spot. Repeat until the bar fills (60 still frames per camera by default).
 
-Each still frame gives `T_world←cam = T_world←cube · T_cam←cube⁻¹`. Frames where the cube moved, flipped poses, and outliers are rejected. The rest are averaged (chordal mean for rotation), then refined by **bundle adjustment**: one solve over the extrinsic plus every frame's cube pose, fitted to the raw tag corners in both cameras. The result goes to `configs/extrinsics.yaml` with its standard error and reprojection error. Once calibrated, a camera's point cloud and frustum join the fused scene, its body keypoints are triangulated with the others, and its tag corners join the probe solve.
+Each still frame gives `T_world←cam = T_world←cube · T_cam←cube⁻¹`. Frames where the cube moved, flipped poses, and outliers are rejected. The rest are averaged (chordal mean for rotation). The result goes to `configs/extrinsics.yaml` with its standard error. Once calibrated, a camera's point cloud and frustum join the fused scene, its body keypoints are triangulated with the others, and its tag corners join the probe solve.
 
 **Calibration health:** whenever the world camera and another camera each see the probe on their own, the RIG panel shows how well their poses agree (rolling median, e.g. "agrees with CAM 1 to 4 mm / 1.1° (GOOD)"). If it turns FAIR or POOR, a camera was probably bumped, so recalibrate.
 
-**Time sync:** frames carry the cameras' own capture timestamps (librealsense global time), and each other camera's frame is paired with the world camera's by capture time. If the other camera's next frame is closer and only milliseconds away, the pairing waits for it. The RIG header shows the remaining skew. For zero skew, connect the cameras' 9-pin sync ports with a genlock cable and set `cameras.hardware_sync: true` (first camera master, the others slaves).
+**Time sync:** frames carry the cameras' own capture timestamps (librealsense global time), and each other camera's frame is paired with the world camera's by capture time. If the other camera's next frame is closer and only milliseconds away, the pairing waits for it. The RIG header shows the remaining skew.
 
 A camera on a USB 2 link uses `cameras.usb2_modes` (640×480@30). If a camera stops delivering frames (unplugged, link reset), its process reconnects automatically once it re-enumerates.
 
@@ -70,9 +70,9 @@ Ported from the DataCollection project into `src/vigil/probe/`: DICT_6X6_50 tags
 3. **Joint solve:** one Gauss–Newton fit of the cube's world pose over every kept corner in every calibrated camera, plus depth measured *inside* each tag (edges often hit the background). It uses an analytic Jacobian and robust weighting and takes about 2 ms. A single tag is weak along its viewing ray, and the other camera and the depth sensor constrain exactly that. The panel shows the fit (px, corners, depth residual).
 4. **Filter:** SE(3) error-state EKF (default, tuned in `configs/probe-filter.json`), One Euro, position Kalman, or raw.
 
-**Pivot calibration of the tip.** The tip offset starts from CAD (`probe.tip_in_object_m`, 192.5 mm along +Y). Press **PIVOT CALIBRATE**, rest the tip in a fixed divot, and rock the probe around it in every direction for ~10 s (≥25° of rotation). Every pose satisfies `R·tip + t = pivot`, so least squares (with outlier rejection) recovers the real tip offset. It's saved to `configs/probe-tip.yaml`, used from then on, and the panel shows "tip: PIVOT".
+**Exposure matters most.** The colour cameras run a fixed 5 ms exposure with high gain (`cameras.color_exposure_ms`, `color_gain`). Auto-exposure picks ~17 ms indoors, which smears a moving tag's ~3 px code cells. Measured with the probe moving: tracked in 99.6% of frames at 5 ms vs 41% on auto. If the image is too dark in your room, raise `color_gain` before lengthening the exposure.
 
-**Infrared detection (optional):** `probe.detect_on: infrared` detects tags in the D435's global-shutter IR image instead of the rolling-shutter colour image, which is sharper under fast motion. The projector alternates on/off per frame (60 fps capture → 30 fps depth + 30 fps clean IR, USB 3 only), and poses are mapped into the colour frame with the factory IR→colour extrinsics. The IR imager's wider field of view gives fewer pixels per tag, so colour stays the default: at ~1.2 m it detected fewer tags than colour here. Use infrared for close range or fast motion.
+
 
 The dashboard shows the Clarius model, the five textured tags on their faces, the cube axes, and the **red tip dot** (`probe.tip_in_object_m`, 192.5 mm along +Y) with a trail. It also reports the tip's XYZ above the floor and its distance to the nearest leg bone (thigh / shin / foot axis), drawn as a gold dashed line. The feeds show detected tag outlines and the projected tip.
 
@@ -119,7 +119,7 @@ src/vigil/
   body.py                 body thread: tracking, batched pose, multi-view triangulation, smoothing
   estimators/             sam3d_body.py, vitpose_depth.py (compiled, batched)
   probe/                  ArUco detection, cube pose, per-view cleaning + joint solve (solver.py),
-                          pivot calibration (pivot.py), filters (EKF/One Euro/Kalman), tracker
+                          filters (EKF/One Euro/Kalman), tracker
   skeleton.py             canonical joints, bones, leg angles
   geometry.py             depth sampling, deprojection, point cloud, floor detection
   filters.py              vectorised One Euro filter
@@ -128,7 +128,7 @@ src/vigil/
   web/                    index.html, style.css, app.js (three.js from CDN)
 ```
 
-Websocket protocol: JSON `hello` / `status` / `calibration` / `frame` messages from the server, and `{"cmd": ...}` from the dashboard (`probe_filter`, `probe_reset`, `pivot_start`, `pivot_cancel`, `calibrate_rig`, `cancel_calibration`, `depth_range`). Binary messages have an 8-byte header (`u8 kind, u8 camera, 2 pad, u32 seq`): kind 1 is mesh vertices (int16 mm), 2 is a JPEG preview, 3 is a point cloud (int16 mm xyz + rgb, in that camera's frame). Other coordinates are in the world frame: the first camera's color optical frame (x right, y down, z forward, metres).
+Websocket protocol: JSON `hello` / `status` / `calibration` / `frame` messages from the server, and `{"cmd": ...}` from the dashboard (`probe_filter`, `probe_reset`, `calibrate_rig`, `cancel_calibration`, `depth_range`). Binary messages have an 8-byte header (`u8 kind, u8 camera, 2 pad, u32 seq`): kind 1 is mesh vertices (int16 mm), 2 is a JPEG preview, 3 is a point cloud (int16 mm xyz + rgb, in that camera's frame). Other coordinates are in the world frame: the first camera's color optical frame (x right, y down, z forward, metres).
 
 ## Performance notes (RTX 3090, 848×480)
 

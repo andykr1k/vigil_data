@@ -297,4 +297,3 @@ html, body {
 .rig-list .health.good { color: var(--ok); }
 .rig-list .health.fair { color: var(--warn); }
 .rig-list .health.poor { color: var(--err); }
-.feed-head .ir { color: #ff9d3d; font-weight: 700; margin-left: 6px; }

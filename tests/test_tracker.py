@@ -1,5 +1,4 @@
-"""End to end on rendered images: real ArUco detection → cleaning → joint solve → world pose,
-for a colour camera and one whose tags are seen by a separate (IR-like) sensor."""
+"""End to end on rendered images: real ArUco detection → cleaning → joint solve → world pose."""
 
 import cv2
 import numpy as np
@@ -48,21 +47,18 @@ def err(pose, T):
             np.degrees(np.arccos(np.clip((np.trace(pose.rotation_matrix.T @ T[:3, :3]) - 1) / 2, -1, 1))))
 
 
-def test_rendered_two_camera_tracking_with_an_ir_sensor():
+def test_rendered_two_camera_tracking():
     tracker = ProbeTracker(Config())
     T_world_obj = to_h(rot([0.4, 0.5, 0.1]), np.array([0.05, 0.0, 0.7]))
-    # Camera 1 = world, tags seen in colour. Camera 2 sees the tags through its IR sensor,
-    # which sits 15 mm to the side of its colour camera (like a D435's left IR imager).
     T_w_c2 = to_h(rot([0.05, -0.8, 0.02]), np.array([0.6, 0.02, 0.3]))
-    T_c2_ir = to_h(np.eye(3), np.array([-0.015, 0.0, 0.0]))  # IR sensor → colour camera
     img1 = cv2.cvtColor(render(tracker, T_world_obj), cv2.COLOR_GRAY2RGB)
-    img2 = render(tracker, np.linalg.inv(T_w_c2 @ T_c2_ir) @ T_world_obj)
+    img2 = cv2.cvtColor(render(tracker, np.linalg.inv(T_w_c2) @ T_world_obj), cv2.COLOR_GRAY2RGB)
     inputs = [ProbeInput("cam1", np.eye(4), K, D, img1, None),
-              ProbeInput("cam2", T_w_c2, K, D, img2, None, T_c2_ir, "infrared")]
+              ProbeInput("cam2", T_w_c2, K, D, img2, None)]
     frame = tracker.track(inputs, timestamp=1.0)
 
     assert set(frame.world_poses) == {"cam1", "cam2"}
-    cams = {"cam1": np.eye(4), "cam2": T_w_c2 @ T_c2_ir}
+    cams = {"cam1": np.eye(4), "cam2": T_w_c2}
     for serial, pose in frame.world_poses.items():
         # Each camera alone: precise across its view, weak along its viewing ray.
         d = (pose.position - T_world_obj[:3, 3]) * 1000
@@ -71,8 +67,7 @@ def test_rendered_two_camera_tracking_with_an_ir_sensor():
         across = np.linalg.norm(d - (d @ ray) * ray)
         # < 15°: a small single tag is noisy in rotation, but not flipped (a flip is ~35°+).
         assert across < 6 and abs(d @ ray) < 25 and err(pose, T_world_obj)[1] < 15, (serial, d)
-    # Per-camera poses are reported in the colour camera frame (what rig calibration needs):
-    # exactly the world pose seen through that camera's extrinsic, IR offset included.
+    # Per-camera poses are in each camera's own frame: the world pose through its extrinsic.
     c2 = frame.cam_poses["cam2"]
     T_c2 = to_h(c2.rotation_matrix, c2.position)
     w2 = frame.world_poses["cam2"]

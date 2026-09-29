@@ -15,11 +15,10 @@ cameras:
   # Used instead when a camera enumerates on USB 2 (USB 3 is needed for 848x480@30).
   usb2_modes:
     - [640, 480, 30]
-  # Used when probe.detect_on is infrared: the projector alternates on/off per frame, so
-  # 60 fps gives 30 fps of depth + 30 fps of clean IR (USB 3 only).
-  infrared_modes:
-    - [848, 480, 60]
-    - [640, 480, 60]
+  # Short fixed colour exposure keeps a moving tag sharp (auto-exposure picks ~17 ms indoors
+  # and smears it). Raise gain if the image is too dark; null = auto-exposure.
+  color_exposure_ms: 5.0
+  color_gain: 128
   depth_min_m: 0.2
   depth_max_m: 6.0
   depth_filters:
@@ -27,10 +26,6 @@ cameras:
     temporal: true
     hole_filling: false
   extrinsics_path: configs/extrinsics.yaml
-  # With a sync cable between the cameras' 9-pin connectors: the first camera drives the
-  # others' exposures (master/slave). Without the cable, frames are still paired by
-  # device timestamp.
-  hardware_sync: false
 
 detector:
   # Person detector (transformers). Used by both pose backends.
@@ -81,14 +76,9 @@ probe:
   filter_preset: configs/probe-filter.json        # DataCollection tuning (method + noise)
   filter_method: null           # override: raw | kalman | ekf | one_euro
   calibration_samples: 60       # still frames per camera for CALIBRATE RIG
-  # color: detect tags in the RGB image. infrared: in the global-shutter IR image with the
-  # projector alternating off (sharper under motion; 60 fps capture, USB 3 cameras only).
-  detect_on: color
   joint_solve: true             # one pose solve over every tag corner in every calibrated camera
   use_depth: true               # also use measured depth at the tag corners (tightens distance)
   max_tag_error_px: 3.0         # drop tags that disagree with the others by more than this
-  tip_calibration_path: configs/probe-tip.yaml   # PIVOT CALIBRATE result; overrides tip_in_object_m
-  pivot_samples: 300            # frames collected while rotating the probe about its tip
 
 smoothing:
   enabled: true

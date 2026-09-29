@@ -28,12 +28,12 @@ class CamerasConfig(_Strict):
     serials: list[str] = []  # [] = every connected RealSense, sorted; the first is the world frame
     modes: list[tuple[int, int, int]] = [(848, 480, 30), (640, 480, 30), (640, 480, 15)]
     usb2_modes: list[tuple[int, int, int]] = [(640, 480, 30)]
-    infrared_modes: list[tuple[int, int, int]] = [(848, 480, 60), (640, 480, 60)]
+    color_exposure_ms: float | None = 5.0  # None = auto-exposure
+    color_gain: float | None = 128.0
     depth_min_m: float = 0.2
     depth_max_m: float = 6.0
     depth_filters: DepthFilters = DepthFilters()
     extrinsics_path: Path = Path("configs/extrinsics.yaml")
-    hardware_sync: bool = False  # genlock cable: first camera master, others slaves
 
 
 class DetectorConfig(_Strict):
@@ -84,12 +84,9 @@ class ProbeConfig(_Strict):
     filter_preset: Path = Path("configs/probe-filter.json")
     filter_method: Literal["raw", "kalman", "ekf", "one_euro"] | None = None
     calibration_samples: int = 60
-    detect_on: Literal["color", "infrared"] = "color"
     joint_solve: bool = True  # one solve over every corner in every calibrated camera
     use_depth: bool = True  # add measured depth at the tag corners to that solve
     max_tag_error_px: float = 3.0  # tags that don't fit the others by this much are dropped
-    tip_calibration_path: Path = Path("configs/probe-tip.yaml")  # written by PIVOT CALIBRATE
-    pivot_samples: int = 300  # ~10 s at 30 fps
 
 
 class SmoothingConfig(_Strict):

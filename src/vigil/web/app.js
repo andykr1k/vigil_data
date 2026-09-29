@@ -226,8 +226,15 @@ function makeSensorGlyph(cam, highlight, calibrated) {
   return g;
 }
 
+// CSS2D labels are DOM elements the label renderer positions each frame; removing their 3D
+// object doesn't remove the element, so without this every rebuild leaves stale labels behind.
+function removeWithLabels(obj) {
+  obj.traverse((o) => { if (o.isCSS2DObject) o.element.remove(); });
+  obj.removeFromParent();
+}
+
 function buildRig(cameras) {
-  for (const rc of rigCams) sensorRoot.remove(rc.group);
+  for (const rc of rigCams) removeWithLabels(rc.group);
   const feeds = $("feeds");
   feeds.innerHTML = "";
   rigCams = cameras.map((cam) => {
@@ -294,6 +301,17 @@ function onCloud(cam, buf) {
   geo.attributes.position.needsUpdate = true;
   geo.attributes.color.needsUpdate = true;
   geo.setDrawRange(0, n);
+  if (cam === FUSED || cam === 0) cloudCentre = medianPoint(pos, n);
+}
+let cloudCentre = null; // sensor-frame centre of the scene, for centring the view
+
+function medianPoint(pos, n) {
+  if (n < 50) return null;
+  const step = Math.max(1, Math.floor(n / 2000));
+  const axes = [[], [], []];
+  for (let i = 0; i < n; i += step) for (let k = 0; k < 3; k++) axes[k].push(pos[i * 3 + k]);
+  const med = (a) => a.sort((x, y) => x - y)[a.length >> 1];
+  return new THREE.Vector3(med(axes[0]), med(axes[1]), med(axes[2]));
 }
 
 // ───────────────────────────── hologram mesh ─────────────────────────────
@@ -364,7 +382,7 @@ function sideOf(name) {
 }
 
 function buildSkeleton(hello) {
-  if (skel) sensorRoot.remove(skel.group);
+  if (skel) removeWithLabels(skel.group);
   const group = new THREE.Group();
   const legSet = new Set(hello.leg_joints);
   const joints = {};
@@ -516,7 +534,7 @@ nearestLine.visible = false;
 sensorRoot.add(nearestLine);
 
 function buildProbe(info) {
-  probeGroup.clear();
+  for (const child of [...probeGroup.children]) removeWithLabels(child);
   probeState.materials = [];
   probeState.live = null;
   probeState.info = info;
@@ -601,9 +619,8 @@ function updateProbe(probe) {
   const fit = probe.fit;
   $("probe-fit").innerHTML = fit
     ? `FIT <b>${fit.rms_px.toFixed(2)} px</b> · ${fit.corners} corners` +
-      (fit.depth_samples ? ` · depth <b>±${fit.depth_rms_mm?.toFixed(0) ?? "—"} mm</b>` : "") +
-      ` · tip: <b>${probe.tip_source === "pivot calibration" ? "PIVOT" : "CAD"}</b>`
-    : `tip: <b>${probe.tip_source === "pivot calibration" ? "PIVOT-CALIBRATED" : "CAD"}</b>`;
+      (fit.depth_samples ? ` · depth <b>±${fit.depth_rms_mm?.toFixed(0) ?? "—"} mm</b>` : "")
+    : "";
   $("probe-cams").textContent = probe.tracked ? `${probe.cameras} CAM${probe.cameras === 1 ? "" : "S"}` : "";
   panel.textContent = probe.tracked ? "TRACKED" : "SEARCHING";
   panel.style.color = probe.tracked ? "var(--ok)" : "var(--warn)";
@@ -660,24 +677,6 @@ document.querySelectorAll("#probe-filter button").forEach((b) => {
   b.onclick = () => send({ cmd: "probe_filter", method: b.dataset.method });
 });
 $("probe-reset").onclick = () => { send({ cmd: "probe_reset" }); tipTrail.clear(); };
-let pivoting = false;
-$("pivot-start").onclick = () => send({ cmd: pivoting ? "pivot_cancel" : "pivot_start" });
-function onPivot(msg) {
-  pivoting = msg.state === "collecting";
-  $("pivot-start").textContent = pivoting ? "CANCEL" : "PIVOT CALIBRATE";
-  $("pivot-progress").hidden = !pivoting;
-  if (!pivoting) $("pivot-progress").firstElementChild.style.width = "0";
-  const el = $("pivot-msg");
-  el.textContent = msg.message;
-  el.className = "rig-msg " + ({ done: "ok", failed: "err" }[msg.state] ?? "");
-}
-function updatePivot(p) {
-  if (!p) return;
-  $("pivot-progress").hidden = false;
-  $("pivot-progress").firstElementChild.style.width = `${Math.round((p.samples / p.target) * 100)}%`;
-  $("pivot-msg").textContent = `Rocking… ${p.samples}/${p.target} frames · ${p.spread_deg.toFixed(0)}° of rotation (need ≥25°)`;
-}
-
 // ───────────────────────────── scene levelling ─────────────────────────────
 const _n = new THREE.Vector3();
 function updateLevel(frame) {
@@ -904,13 +903,6 @@ function updateRigHealth(frame) {
       : rc.info.T_world_camera ? "agreement: show the probe to both cameras" : "";
   }
   if (rigCams.length > 1) $("rig-meta").textContent = `${rigCams.length} CAMS · SYNC ${frame.sync_ms?.toFixed(0) ?? "—"} MS`;
-  for (const v of frame.views) {
-    const head = rigCams[v.cam]?.feed?.parentElement?.querySelector(".feed-head span");
-    if (!head) continue;
-    let tag = head.querySelector(".ir");
-    if (v.tag_source === "infrared" && !tag) { tag = document.createElement("span"); tag.className = "ir"; tag.textContent = "IR TAGS"; head.appendChild(tag); }
-    if (v.tag_source !== "infrared" && tag) tag.remove();
-  }
 }
 
 let calibrating = false;
@@ -1071,7 +1063,6 @@ function connect() {
     if (msg.type === "hello") onHello(msg);
     else if (msg.type === "status") setStatus(msg.state, msg.message);
     else if (msg.type === "calibration") onCalibration(msg);
-    else if (msg.type === "pivot") onPivot(msg);
     else if (msg.type === "frame") onFrame(msg);
   };
 }
@@ -1104,6 +1095,7 @@ function onBinary(buf) {
 }
 
 let personSeenAt = 0;
+let focusSeenAt = 0;
 function onFrame(frame) {
   lastFrame = frame;
   if (frame.person) personSeenAt = performance.now();
@@ -1113,15 +1105,16 @@ function onFrame(frame) {
   updateProbe(frame.probe);
   updateHud(frame);
   syncDepthUI(frame.depth_range);
-  updatePivot(frame.pivot);
   updateRigHealth(frame);
-  if (frame.person && opts.follow) {
-    const p = frame.person.joints.pelvis;
-    if (p) {
-      const target = sensorRoot.localToWorld(new THREE.Vector3(p[0], p[1], p[2]));
-      target.y = Math.max(0.6, target.y);
-      followTarget.lerp(target, 0.15);
-    }
+  // Keep the view centred on what matters: the subject, else the probe, else the scene.
+  const focus = frame.person?.joints?.pelvis ?? (frame.probe?.tracked ? frame.probe.position : null);
+  if (focus) {
+    focusSeenAt = performance.now();
+    const target = sensorRoot.localToWorld(new THREE.Vector3(focus[0], focus[1], focus[2]));
+    followTarget.lerp(target, frame.person ? 0.15 : 0.05);
+  } else if (cloudCentre) {
+    focusSeenAt = performance.now();
+    followTarget.lerp(sensorRoot.localToWorld(cloudCentre.clone()), 0.05);
   }
 }
 
@@ -1152,7 +1145,7 @@ function tick() {
     if (!probeFresh) probeState.tipLabel.el.innerHTML = "<small>PROBE</small>NOT TRACKED";
   }
 
-  if (opts.follow && performance.now() - personSeenAt < 1500) {
+  if (opts.follow && performance.now() - focusSeenAt < 1500) {
     const delta = _focus.copy(followTarget).sub(controls.target).multiplyScalar(0.08);
     controls.target.add(delta);
     camera.position.add(delta);

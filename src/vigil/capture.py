@@ -94,54 +94,8 @@ class FrameBuffer:
             self.shm.unlink()
 
 
-class IrBuffer:
-    """Shared-memory ring of projector-off infrared images (uint8 gray) for tag detection."""
-
-    _H = 1 + SLOTS * 4  # [latest_slot] + per-slot [index, ts, w, h]
-
-    def __init__(self, max_pixels: int, name: str | None = None):
-        size = self._H * 8 + SLOTS * max_pixels
-        self.shm = shared_memory.SharedMemory(name=name, create=name is None, size=size)
-        self.max_pixels = max_pixels
-        self.header = np.ndarray((self._H,), np.float64, self.shm.buf, 0)
-        self.data = [np.ndarray((max_pixels,), np.uint8, self.shm.buf, self._H * 8 + i * max_pixels)
-                     for i in range(SLOTS)]
-        if name is None:
-            self.header[:] = -1
-
-    @property
-    def name(self) -> str:
-        return self.shm.name
-
-    def write(self, gray: np.ndarray, index: int, ts: float) -> None:
-        h, w = gray.shape
-        slot = (int(self.header[0]) + 1) % SLOTS if self.header[0] >= 0 else 0
-        self.data[slot][: h * w] = gray.reshape(-1)
-        self.header[1 + slot * 4: 5 + slot * 4] = (index, ts, w, h)
-        self.header[0] = slot
-
-    def read_nearest(self, ts: float) -> tuple[np.ndarray, float, int] | None:
-        newest = int(self.header[0])
-        if newest < 0:
-            return None
-        slots = [i for i in range(SLOTS) if self.header[1 + i * 4] >= 0 and i != (newest + 1) % SLOTS]
-        slot = min(slots, key=lambda i: abs(self.header[2 + i * 4] - ts))
-        index, t, w, h = self.header[1 + slot * 4: 5 + slot * 4]
-        img = self.data[slot][: int(w) * int(h)].reshape(int(h), int(w)).copy()
-        if int(self.header[1 + slot * 4]) != int(index):
-            return None  # overwritten while copying
-        return img, float(t), int(index)
-
-    def close(self, unlink: bool = False) -> None:
-        self.header = self.data = None
-        self.shm.close()
-        if unlink:
-            self.shm.unlink()
-
-
 def _camera_main(cfg: CamerasConfig, serial: str, shm_name: str, max_pixels: int,
-                 info_q: mp.Queue, stop: mp.Event, sync_role: int = 0,
-                 ir_name: str | None = None) -> None:
+                 info_q: mp.Queue, stop: mp.Event) -> None:
     """Child process: capture → temporal filter → align → shared memory."""
     from .camera import RealSenseCamera
 
@@ -150,15 +104,13 @@ def _camera_main(cfg: CamerasConfig, serial: str, shm_name: str, max_pixels: int
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     buf = FrameBuffer(max_pixels, name=shm_name)
-    ir_buf = IrBuffer(max_pixels, name=ir_name) if ir_name else None
     try:
-        cam = RealSenseCamera(cfg, serial, sync_role, infrared=ir_buf is not None)
+        cam = RealSenseCamera(cfg, serial)
     except RuntimeError as e:
         info_q.put({"serial": serial, "error": str(e)})
         return
     gen, state = -1, None
     frame = None
-    last_ir = -1
     try:
         while not stop.is_set():
             if cam.generation != gen or cam.state != state:
@@ -166,15 +118,7 @@ def _camera_main(cfg: CamerasConfig, serial: str, shm_name: str, max_pixels: int
                 K = cam.intrinsics
                 info_q.put({"serial": serial, "name": cam.name, "usb": cam.usb, "mode": cam.mode,
                             "depth_scale": cam.depth_scale, "state": cam.state,
-                            "generation": gen, "intrinsics": K.__dict__,
-                            "infrared": cam.infrared,
-                            "ir_intrinsics": cam.ir_intrinsics.__dict__ if cam.ir_intrinsics else None,
-                            "T_color_ir": None if cam.T_color_ir is None else cam.T_color_ir.tolist()})
-            if ir_buf is not None:
-                ir = cam.latest_ir()
-                if ir is not None and ir[2] != last_ir:
-                    last_ir = ir[2]
-                    ir_buf.write(ir[0], ir[2], ir[1])
+                            "generation": gen, "intrinsics": K.__dict__})
             f = cam.latest(frame.index if frame else -1, timeout=0.5, raw_depth=True)
             if f is None:
                 continue
@@ -183,31 +127,23 @@ def _camera_main(cfg: CamerasConfig, serial: str, shm_name: str, max_pixels: int
     finally:
         cam.close()
         buf.close()
-        if ir_buf is not None:
-            ir_buf.close()
 
 
 class CameraClient:
     """Main-process handle to a camera process; mirrors RealSenseCamera's read API."""
 
-    def __init__(self, cfg: CamerasConfig, serial: str, sync_role: int = 0,
-                 infrared: bool = False, ctx=None):
+    def __init__(self, cfg: CamerasConfig, serial: str, ctx=None):
         ctx = ctx or mp.get_context("spawn")
         self.serial = serial
         self.state = "starting"
         self.generation = 0
         self.max_pixels = _max_pixels(cfg)
         self.buffer = FrameBuffer(self.max_pixels)
-        self.ir_buffer = IrBuffer(self.max_pixels) if infrared else None
-        self.infrared = False
-        self.ir_intrinsics: Intrinsics | None = None
-        self.T_color_ir: np.ndarray | None = None
         self._info_q: mp.Queue = ctx.Queue()
         self._stop = ctx.Event()
         self._proc = ctx.Process(
             target=_camera_main, name=f"camera-{serial}", daemon=True,
-            args=(cfg, serial, self.buffer.name, self.max_pixels, self._info_q, self._stop, sync_role,
-                  self.ir_buffer.name if self.ir_buffer else None),
+            args=(cfg, serial, self.buffer.name, self.max_pixels, self._info_q, self._stop),
         )
         self._proc.start()
         # Wait until streaming (or failed); notice a crashed child immediately.
@@ -232,12 +168,6 @@ class CameraClient:
         k = info["intrinsics"]
         self.intrinsics = Intrinsics(k["width"], k["height"], k["fx"], k["fy"], k["cx"], k["cy"],
                                      tuple(k["coeffs"]))
-        self.infrared = bool(info.get("infrared"))
-        ki = info.get("ir_intrinsics")
-        self.ir_intrinsics = None if not ki else Intrinsics(
-            ki["width"], ki["height"], ki["fx"], ki["fy"], ki["cx"], ki["cy"], tuple(ki["coeffs"]))
-        T = info.get("T_color_ir")
-        self.T_color_ir = None if T is None else np.asarray(T, dtype=np.float64)
 
     def poll_info(self) -> bool:
         """Apply status updates from the camera process; True if intrinsics/mode changed."""
@@ -249,12 +179,6 @@ class CameraClient:
                 return changed
             changed |= info.get("generation") != self.generation
             self._apply(info)
-
-    def ir_nearest(self, ts: float) -> tuple[np.ndarray, float, int] | None:
-        """Projector-off IR image captured closest to `ts` (infrared tag detection)."""
-        if not self.infrared or self.ir_buffer is None:
-            return None
-        return self.ir_buffer.read_nearest(ts)
 
     def nearest(self, ts: float) -> Frame | None:
         """The buffered frame captured closest to `ts` (for pairing with another camera)."""
@@ -293,5 +217,3 @@ class CameraClient:
         if self._proc.is_alive():
             self._proc.terminate()
         self.buffer.close(unlink=True)
-        if self.ir_buffer is not None:
-            self.ir_buffer.close(unlink=True)

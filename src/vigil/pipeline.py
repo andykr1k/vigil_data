@@ -68,7 +68,6 @@ class Pipeline:
         # only show pixels whose depth — from their own camera — falls inside it.
         self.depth_range = (cfg.cameras.depth_min_m, cfg.cameras.depth_max_m)
         self.mask_feeds = False
-        self._pivot = None  # PivotCalibrator while a tip calibration is running
         self._health = RigHealth()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._main, name="pipeline", daemon=True)
@@ -99,8 +98,7 @@ class Pipeline:
             from .estimators import build_estimator
 
             self._set_status("loading", "Starting camera processes…")
-            rig = Rig(self.cfg.cameras, self.cfg.resolve(self.cfg.cameras.extrinsics_path),
-                      infrared=self.cfg.probe.enabled and self.cfg.probe.detect_on == "infrared")
+            rig = Rig(self.cfg.cameras, self.cfg.resolve(self.cfg.cameras.extrinsics_path))
             # The detector loads in its own process while we load/compile the pose model here.
             detector = DetectorProcess(self.cfg, [rc.camera.buffer for rc in rig.cameras])
             self._set_status("loading", f"Loading pose model ({self.cfg.estimator.backend})…")
@@ -155,7 +153,6 @@ class Pipeline:
                             "x_axis": list(m.x_axis), "y_axis": list(m.y_axis)}
                            for m in g.mounts.values()],
                 "method": tracker.filter.method,
-                "tip_source": tracker.tip_source,
             }
         self.hello = {
             "type": "hello",
@@ -218,24 +215,9 @@ class Pipeline:
                 probe = self._probe_json(pf, rig, frames, views, tracker,
                                          body.joints_at(f0.timestamp))
                 self._health.add(rig.world.serial, pf.world_poses, f0.timestamp)
-                if self._pivot is not None:
-                    self._pivot.add(pf.measured)
-                    if self._pivot.finished():
-                        self._finish_pivot(rig, tracker, backend)
                 if calibrator is not None:
                     try:
-                        cam_poses = pf.cam_poses
-                        obs = {}
-                        for rc in rig.cameras:
-                            if rc.serial not in cam_poses:
-                                continue
-                            ir = pf.sources.get(rc.serial) == "infrared"
-                            K = rc.camera.ir_intrinsics if ir else rc.camera.intrinsics
-                            tags = [(tracker.geometry.marker_corners_in_object(m.marker_id), m.image_corners)
-                                    for m in pf.views[rc.serial].markers]
-                            T_img_cam = np.linalg.inv(rc.camera.T_color_ir) if ir else None
-                            obs[rc.serial] = (K.matrix().astype(np.float64), K.dist_coeffs(), tags, T_img_cam)
-                        calibrator.add(rig.world.serial, cam_poses, obs)
+                        calibrator.add(rig.world.serial, pf.cam_poses)
                         calibrator = self._check_calibration(rig, calibrator, backend, tracker)
                     except Exception as e:  # a failed calibration must not stop streaming
                         log.error("rig calibration failed:\n%s", traceback.format_exc())
@@ -287,7 +269,6 @@ class Pipeline:
                                 "mask_feeds": self.mask_feeds},
                 "calibration": None if calibrator is None else {
                     "progress": calibrator.progress(), "target": calibrator.target},
-                "pivot": None if self._pivot is None else self._pivot.progress(),
                 "rig_health": self._health.report(f0.timestamp),
                 "floor": None if floor is None else {
                     "normal": [float(v) for v in floor[0]], "height": round(floor[1], 4)},
@@ -302,16 +283,9 @@ class Pipeline:
         for rc in rig.cameras:
             if not fresh[rc.index]:
                 continue
-            f, cam = frames[rc.index], rc.camera
-            ir = cam.ir_nearest(f.timestamp) if cam.infrared else None
-            if ir is not None:  # projector-off IR image, paired by capture time
-                K = cam.ir_intrinsics
-                inputs.append(ProbeInput(rc.serial, rc.T_world_camera, K.matrix().astype(np.float64),
-                                         K.dist_coeffs(), ir[0], None, cam.T_color_ir, "infrared"))
-            else:
-                K = cam.intrinsics
-                inputs.append(ProbeInput(rc.serial, rc.T_world_camera, K.matrix().astype(np.float64),
-                                         K.dist_coeffs(), f.color, f.depth))
+            f, K = frames[rc.index], rc.camera.intrinsics
+            inputs.append(ProbeInput(rc.serial, rc.T_world_camera, K.matrix().astype(np.float64),
+                                     K.dist_coeffs(), f.color, f.depth))
         return tracker.track(inputs, timestamp)
 
     def _probe_json(self, pf, rig: Rig, frames, views, tracker, joints) -> dict:
@@ -321,26 +295,12 @@ class Pipeline:
             h, w = frames[rc.index].color.shape[:2]
             kept = {m.marker_id for m in view.markers}
             dets = views[rc.index].setdefault("markers", [])
-            views[rc.index]["tag_source"] = pf.sources.get(serial, "color")
-            if pf.sources.get(serial) == "infrared":
-                # Detected in the IR image: show the tags where they fall in the colour feed.
-                pose = pf.cam_poses.get(serial)
-                if pose is not None:
-                    K = rc.camera.intrinsics
-                    rvec, _ = cv2.Rodrigues(pose.rotation_matrix)
-                    for m in view.markers:
-                        uv, _ = cv2.projectPoints(tracker.geometry.marker_corners_in_object(m.marker_id),
-                                                  rvec, pose.position, K.matrix().astype(np.float64),
-                                                  K.dist_coeffs())
-                        dets.append({"id": m.marker_id,
-                                     "corners": [_vec(c / [w, h]) for c in uv.reshape(4, 2)]})
-            else:
-                for m in view.markers:
-                    dets.append({"id": m.marker_id, "corners": [_vec(c / [w, h]) for c in m.image_corners]})
+            for m in view.markers:
+                dets.append({"id": m.marker_id, "corners": [_vec(c / [w, h]) for c in m.image_corners]})
             views[rc.index]["rejected_tags"] = [i for i in view.rejected if i not in kept]
         est = pf.estimate
         probe = {"tracked": est is not None, "method": tracker.filter.method,
-                 "cameras": len(pf.world_poses), "tip_source": tracker.tip_source}
+                 "cameras": len(pf.world_poses)}
         if pf.refined is not None:
             r = pf.refined
             probe["fit"] = {"rms_px": round(r.rms_px, 2), "corners": r.corners,
@@ -370,31 +330,6 @@ class Pipeline:
             views[rc.index]["tip"] = [round(float(u / K.width), 4), round(float(v / K.height), 4)]
         return probe
 
-    def _finish_pivot(self, rig: Rig, tracker, backend: str) -> None:
-        from .probe.pivot import save_tip, solve_pivot
-
-        cal, self._pivot = self._pivot, None
-        res = solve_pivot(cal.poses)
-        if res is None:
-            self._pivot_result("failed", "Not enough tracked frames — keep the cube visible.")
-        elif res.spread_deg < cal.min_spread_deg:
-            self._pivot_result("failed", f"Only {res.spread_deg:.0f}° of rotation — rock the probe "
-                                         f"more (≥{cal.min_spread_deg:.0f}°) around the tip.")
-        elif res.rms_mm > 5.0:
-            self._pivot_result("failed", f"Tip moved during capture (±{res.rms_mm:.1f} mm). Keep the "
-                                         "tip seated in the divot and try again.")
-        else:
-            save_tip(tracker.tip_path, res, tracker.cad_tip)
-            tracker.set_tip(res.tip, "pivot calibration")
-            delta = np.linalg.norm(res.tip - tracker.cad_tip) * 1000
-            self._send_hello(rig, backend, tracker)
-            self._pivot_result("done", f"Tip calibrated: ±{res.rms_mm:.1f} mm over {res.samples} frames, "
-                                       f"{res.spread_deg:.0f}° of rotation; {delta:.1f} mm from the CAD tip.")
-
-    def _pivot_result(self, state: str, message: str) -> None:
-        log.info("pivot calibration %s: %s", state, message)
-        self.publish({"type": "pivot", "state": state, "message": message}, [])
-
     # ------------------------------------------------------------------ commands
     def _handle_commands(self, rig, tracker, calibrator, backend):
         while True:
@@ -410,15 +345,6 @@ class Pipeline:
                     tracker.filter.reset()
                 elif cmd == "depth_range":
                     self._set_depth_range(msg)
-                elif cmd == "pivot_start" and tracker is not None:
-                    from .probe.pivot import PivotCalibrator
-
-                    self._pivot = PivotCalibrator(target=self.cfg.probe.pivot_samples)
-                    self._pivot_result("collecting", "Seat the tip in a fixed divot and rock the "
-                                       "probe around it in every direction (~10 s).")
-                elif cmd == "pivot_cancel" and self._pivot is not None:
-                    self._pivot = None
-                    self._pivot_result("cancelled", "Pivot calibration cancelled.")
                 elif cmd == "calibrate_rig":
                     calibrator = self._start_calibration(rig, tracker)
                 elif cmd == "cancel_calibration" and calibrator is not None:
@@ -436,7 +362,7 @@ class Pipeline:
             return None
         self._calibration_result("collecting", "Hold the probe still where every camera sees "
                                  "its tags; move it to a new spot every few seconds.")
-        return RigCalibrator(self.cfg.probe.calibration_samples, geometry=tracker.geometry)
+        return RigCalibrator(self.cfg.probe.calibration_samples)
 
     def _check_calibration(self, rig: Rig, cal: RigCalibrator, backend: str, tracker):
         others = [rc.serial for rc in rig.cameras[1:]]

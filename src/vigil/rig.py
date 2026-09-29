@@ -63,7 +63,7 @@ class RigCamera:
 
 
 class Rig:
-    def __init__(self, cfg: CamerasConfig, extrinsics_path: Path, infrared: bool = False):
+    def __init__(self, cfg: CamerasConfig, extrinsics_path: Path):
         self.cfg = cfg
         self.extrinsics_path = extrinsics_path
         self.warnings: list[str] = []
@@ -72,9 +72,8 @@ class Rig:
             raise RuntimeError("No RealSense connected")
         self.cameras: list[RigCamera] = []
         for serial in serials:
-            role = (1 if not self.cameras else 2) if cfg.hardware_sync else 0
             try:
-                cam = CameraClient(cfg, serial, sync_role=role, infrared=infrared)
+                cam = CameraClient(cfg, serial)
             except RuntimeError as e:
                 self.warnings.append(str(e))
                 log.warning("%s", e)
@@ -155,16 +154,11 @@ class RigCalibrator:
 
     target: int
     timeout_s: float = 60.0
-    geometry: object | None = None  # ProbeGeometry; enables the joint (bundle) refinement
     started: float = field(default_factory=time.monotonic)
     samples: dict[str, list[np.ndarray]] = field(default_factory=dict)
-    # Raw corner observations per sample, for the joint refinement: (world obs, camera obs)
-    # where each obs is (K, dist, [(object corners (4,3), image corners (4,2)), ...]).
-    observations: dict[str, list[tuple | None]] = field(default_factory=dict)
     _recent: deque = field(default_factory=lambda: deque(maxlen=5))
 
-    def add(self, world_serial: str, poses: dict[str, ObjectPose],
-            observations: dict[str, tuple] | None = None) -> None:
+    def add(self, world_serial: str, poses: dict[str, ObjectPose]) -> None:
         wp = poses.get(world_serial)
         if wp is None:
             self._recent.clear()
@@ -186,10 +180,6 @@ class RigCalibrator:
                 continue
             T_cam_cube = to_h(p.rotation_matrix, p.position)
             self.samples.setdefault(serial, []).append(T_world_cube @ np.linalg.inv(T_cam_cube))
-            obs = None
-            if observations and world_serial in observations and serial in observations:
-                obs = (observations[world_serial], observations[serial], T_world_cube)
-            self.observations.setdefault(serial, []).append(obs)
 
     def progress(self) -> dict[str, int]:
         return {s: len(v) for s, v in self.samples.items()}
@@ -229,94 +219,11 @@ class RigCalibrator:
             "stderr_deg": round(float(rot_spread / np.sqrt(n)), 3),
             "calibrated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
-        T = to_h(R_mean, t_mean)
-        # Joint refinement: the extrinsic plus every sample's cube pose, fitted to the raw
-        # tag corners seen by both cameras (instead of averaging per-frame estimates).
-        obs = [o for o, k in zip(self.observations.get(serial, []), keep) if k and o is not None]
-        if len(obs) >= 8:
-            refined = _bundle_extrinsic(T, obs)
-            if refined is not None and refined[2] <= refined[1] * 1.05:
-                T = refined[0]
-                meta["method"] = "bundle adjustment"
-                meta["reprojection_px_before"] = round(refined[1], 3)
-                meta["reprojection_px"] = round(refined[2], 3)
-        return T, meta
+        return to_h(R_mean, t_mean), meta
 
 
 def _angle_deg(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.degrees(np.arccos(np.clip((np.trace(a.T @ b) - 1) / 2, -1, 1))))
-
-
-def _se3(x: np.ndarray) -> np.ndarray:
-    import cv2
-
-    R, _ = cv2.Rodrigues(x[:3])
-    return to_h(R, x[3:6])
-
-
-def _xi(T: np.ndarray) -> np.ndarray:
-    import cv2
-
-    return np.concatenate([cv2.Rodrigues(T[:3, :3])[0].ravel(), T[:3, 3]])
-
-
-def _bundle_extrinsic(T_init: np.ndarray, samples: list[tuple]):
-    """Least squares over [extrinsic, cube pose per sample] against all observed corners.
-
-    Returns (T_world_cam, rms_px_before, rms_px_after) or None.
-    """
-    import cv2
-    from scipy.optimize import least_squares
-    from scipy.sparse import lil_matrix
-
-    def project(T_cam_obj, obs):
-        """Reprojection residuals (px) of every corner. (Depth isn't used here: with many
-        frames averaged it doesn't beat multi-frame PnP along the ray, and it would import
-        the depth sensor's scale bias into the extrinsic.)"""
-        K, dist, tags = obs[:3]
-        if len(obs) > 3 and obs[3] is not None:  # tags seen by another sensor (IR) of this camera
-            T_cam_obj = obs[3] @ T_cam_obj
-        P = np.concatenate([t[0] for t in tags])
-        uv = np.concatenate([t[1] for t in tags])
-        rvec, _ = cv2.Rodrigues(T_cam_obj[:3, :3])
-        proj, _ = cv2.projectPoints(P, rvec, T_cam_obj[:3, 3], K, dist)
-        return (proj.reshape(-1, 2) - uv).ravel()
-
-    n = len(samples)
-    x0 = np.concatenate([_xi(T_init)] + [_xi(s[2]) for s in samples])
-
-    def residuals(x):
-        T_wc = _se3(x[:6])
-        T_cw = np.linalg.inv(T_wc)
-        out = []
-        for i, (obs_w, obs_c, _) in enumerate(samples):
-            T_wo = _se3(x[6 + 6 * i: 12 + 6 * i])
-            out.append(project(T_wo, obs_w))
-            out.append(project(T_cw @ T_wo, obs_c))
-        return np.concatenate(out)
-
-    r0 = residuals(x0)
-    # Sparsity: sample i's world residuals depend on its pose; its camera residuals on its
-    # pose and the extrinsic.
-    def n_res(obs):  # 2 residuals (u, v) per observed corner
-        return 2 * sum(len(t[1]) for t in obs[2])
-
-    sizes = [(n_res(s[0]), n_res(s[1])) for s in samples]
-    J = lil_matrix((len(r0), len(x0)), dtype=int)
-    row = 0
-    for i, (nw, nc) in enumerate(sizes):
-        J[row: row + nw + nc, 6 + 6 * i: 12 + 6 * i] = 1
-        J[row + nw: row + nw + nc, :6] = 1
-        row += nw + nc
-    try:
-        sol = least_squares(residuals, x0, jac_sparsity=J, loss="soft_l1", f_scale=2.0,
-                            x_scale="jac", max_nfev=3000)
-    except (ValueError, np.linalg.LinAlgError):
-        return None
-    def rms_px(x):
-        return float(np.sqrt(np.mean(residuals(x).reshape(-1, 2) ** 2) * 2))
-
-    return _se3(sol.x[:6]), rms_px(x0), rms_px(sol.x)
 
 
 class RigHealth:

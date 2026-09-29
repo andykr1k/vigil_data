@@ -22,26 +22,29 @@ cameras:
       - 1.0
   '327122078549':
     T_reference_camera:
-    - - -0.917087
-      - -0.1834
-      - 0.354001
-      - -0.076093
-    - - 0.38346
-      - -0.162698
-      - 0.909114
-      - -0.57403
-    - - -0.109136
-      - 0.969481
-      - 0.219535
-      - 0.504443
+    - - -0.786838
+      - -0.418102
+      - 0.453957
+      - -0.253711
+    - - 0.572925
+      - -0.221389
+      - 0.789141
+      - -0.588748
+    - - -0.22944
+      - 0.881009
+      - 0.413739
+      - 0.455051
     - - 0.0
       - 0.0
       - 0.0
       - 1.0
-    samples: 56
-    rejected: 4
-    spread_mm: 7.69
-    spread_deg: 0.463
-    stderr_mm: 1.03
-    stderr_deg: 0.062
-    calibrated_at: '2026-09-29T17:54:05+00:00'
+    samples: 48
+    rejected: 12
+    spread_mm: 4.91
+    spread_deg: 0.379
+    stderr_mm: 0.71
+    stderr_deg: 0.055
+    calibrated_at: '2026-09-29T18:34:19+00:00'
+    method: bundle adjustment
+    reprojection_px_before: 0.94
+    reprojection_px: 0.634
