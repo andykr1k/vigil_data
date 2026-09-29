@@ -14,3 +14,6 @@ wheels/
 
 # Third-party model code / weights fetched by `vigil setup`
 third_party/
+
+# Secrets (probe certificates, keys)
+secrets/

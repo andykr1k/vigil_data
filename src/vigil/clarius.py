@@ -327,5 +327,11 @@ def from_config(cfg) -> ClariusProbe | None:
     if not sdk.is_file():
         raise RuntimeError(f"Solum SDK not found at {sdk}. Run `uv run vigil setup`.")
     cert = os.environ.get("CLARIUS_CERT") or None
+    cert_path = os.environ.get("CLARIUS_CERT_PATH")
+    if not cert and cert_path:
+        path = cfg.resolve(Path(cert_path))
+        if not path.is_file():
+            raise RuntimeError(f"CLARIUS_CERT_PATH not found: {path}")
+        cert = path.read_bytes().decode()  # exactly as issued (CRLF line endings kept)
     return ClariusProbe(sdk, cfg.resolve(c.store_dir), c.ip, c.port, c.model, c.application, cert,
                         c.width, c.height)
