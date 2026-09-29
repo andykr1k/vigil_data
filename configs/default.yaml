@@ -80,6 +80,19 @@ probe:
   use_depth: true               # also use measured depth at the tag corners (tightens distance)
   max_tag_error_px: 3.0         # drop tags that disagree with the others by more than this
 
+clarius:
+  # Clarius ultrasound over the Solum SDK. Join the probe's Wi-Fi with a spare adapter;
+  # the certificate goes in .env as CLARIUS_CERT. `uv run vigil setup` fetches the SDK.
+  enabled: true
+  sdk_path: third_party/solum/libsolum.so
+  store_dir: third_party/solum/keys
+  ip: 192.168.1.1          # probe address on its access point
+  port: null               # control port; null = scan the probe for it (logged once found)
+  model: PALHD3
+  application: msk         # preset: msk, msk_knee, msk_hip, dvt, vascular, nerve, ...
+  width: 640
+  height: 480
+
 smoothing:
   enabled: true
   min_cutoff: 1.5   # One Euro filter: lower = smoother when still

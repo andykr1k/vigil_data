@@ -16,6 +16,21 @@ SAM3D_REPO = "https://github.com/facebookresearch/sam-3d-body"
 SAM3D_COMMIT = "b5c765a0d89d789985e186d396315e7590887b94"
 
 
+SOLUM_VERSION = "v12.2.4"
+SOLUM_ASSET = "solum-12.2.4-linux.x86_64-gcc_ubuntu_24.04.zip"
+
+
+def _download_solum(dest) -> None:
+    import io
+    import urllib.request
+    import zipfile
+
+    url = f"https://github.com/clariusdev/solum/releases/download/{SOLUM_VERSION}/{SOLUM_ASSET}"
+    dest.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url) as r:
+        zipfile.ZipFile(io.BytesIO(r.read())).extractall(dest)
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     import uvicorn
 
@@ -67,6 +82,12 @@ def cmd_setup(args: argparse.Namespace) -> None:
         subprocess.run(["git", "clone", "-q", SAM3D_REPO, str(repo_dir)], check=True)
     subprocess.run(["git", "-C", str(repo_dir), "checkout", "-q", SAM3D_COMMIT], check=True)
     print(f"✓ SAM 3D Body code @ {SAM3D_COMMIT[:8]}")
+
+    sdk = cfg.resolve(cfg.clarius.sdk_path)
+    if not sdk.is_file():
+        print(f"→ downloading the Clarius Solum SDK ({SOLUM_VERSION}) into {sdk.parent}")
+        _download_solum(sdk.parent)
+    print("✓ Solum SDK")
 
     print("→ caching DINOv3 backbone code (torch.hub)")
     torch.hub.list("facebookresearch/dinov3", trust_repo=True, verbose=False)

@@ -77,6 +77,15 @@
     <section class="panel collapsible" id="panel-probe">
       <header><span>PROBE</span><span class="unit" id="probe-state">OFFLINE</span><button class="chev" aria-label="Collapse"></button></header>
       <div class="body">
+        <div class="clarius" id="clarius" hidden>
+          <div class="cl-head"><span class="dot" id="cl-dot"></span><b id="cl-model">CLARIUS</b><span id="cl-state">—</span></div>
+          <div class="cl-stats">
+            <div><dt>BATTERY</dt><dd id="cl-batt">—</dd><i class="meter"><b id="cl-batt-bar"></b></i></div>
+            <div><dt>TEMP</dt><dd id="cl-temp">—</dd><i class="meter"><b id="cl-temp-bar"></b></i></div>
+            <div><dt>US FPS</dt><dd id="cl-fps">—</dd></div>
+          </div>
+          <p class="rig-msg err" id="cl-err"></p>
+        </div>
         <div class="tag-chips" id="tag-chips">
           <span data-tag="0">0</span><span data-tag="1">1</span><span data-tag="2">2</span><span data-tag="3">3</span><span data-tag="4">4</span>
           <em id="probe-cams"></em>
@@ -155,6 +164,18 @@
         <div class="btn-row one"><button id="rig-calibrate">CALIBRATE RIG</button></div>
         <div class="cal-progress" id="cal-progress" hidden><i></i></div>
         <p class="rig-msg" id="rig-msg"></p>
+      </div>
+    </section>
+
+    <section class="panel collapsible" id="panel-us" hidden>
+      <header><span>ULTRASOUND</span><span class="unit" id="us-meta"></span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body">
+        <canvas id="us-canvas"></canvas>
+        <div class="us-ctl">
+          <label>DEPTH <input type="range" id="us-depth" min="1" max="30" step="0.5"><b><span id="us-depth-v">—</span> cm</b></label>
+          <label>GAIN <input type="range" id="us-gain" min="0" max="100" step="1"><b><span id="us-gain-v">—</span> %</b></label>
+          <button id="us-run">FREEZE</button>
+        </div>
       </div>
     </section>
 

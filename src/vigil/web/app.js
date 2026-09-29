@@ -9,7 +9,7 @@ import { CSS2DRenderer, CSS2DObject } from "three/addons/renderers/CSS2DRenderer
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 
 // Binary messages: u8 kind, u8 camera, 2 pad, u32 seq (must match pipeline.py).
-const MSG_MESH = 1, MSG_JPEG = 2, MSG_CLOUD = 3;
+const MSG_MESH = 1, MSG_JPEG = 2, MSG_CLOUD = 3, MSG_ULTRASOUND = 4;
 const FUSED = 255; // camera index of the fused world-frame cloud
 
 const COLORS = {
@@ -995,6 +995,64 @@ function syncDepthUI(range) {
   if (depthUI.mask.checked !== range.mask_feeds) depthUI.mask.checked = range.mask_feeds;
 }
 
+// ───────────────────────────── clarius ultrasound ─────────────────────────────
+const us = { canvas: $("us-canvas"), image: null, localUntil: 0, sendTimer: null, imaging: false };
+us.ctx = us.canvas.getContext("2d");
+
+function onUltrasound(buf) {
+  createImageBitmap(new Blob([new Uint8Array(buf, 8)], { type: "image/jpeg" }))
+    .then((bmp) => {
+      us.image?.close?.();
+      us.image = bmp;
+      const c = us.canvas, w = c.clientWidth;
+      if (!w) return; // panel collapsed
+      c.style.aspectRatio = `${bmp.width} / ${bmp.height}`;
+      if (c.width !== bmp.width) { c.width = bmp.width; c.height = bmp.height; }
+      us.ctx.drawImage(bmp, 0, 0);
+    })
+    .catch(() => {});
+}
+
+function updateClarius(c) {
+  if (!c) return;
+  const dot = $("cl-dot");
+  dot.className = "dot " + (c.imaging ? "ok" : c.connected ? "warn" : "err");
+  $("cl-state").textContent = c.state ?? "—";
+  const meter = (id, v, bad) => {
+    $(id).textContent = v == null ? "—" : `${v}%`;
+    const bar = $(id + "-bar");
+    bar.style.width = v == null ? "0" : `${Math.max(0, Math.min(100, v))}%`;
+    bar.style.background = v == null ? "" : bad(v) ? "var(--err)" : bad(v + 15) ? "var(--warn)" : "var(--ok)";
+  };
+  meter("cl-batt", c.battery, (v) => v < 15);
+  meter("cl-temp", c.temperature, (v) => v > 85);
+  if (c.charging) $("cl-batt").textContent += " ⚡";
+  $("cl-fps").textContent = c.fps ? c.fps.toFixed(0) : "—";
+  $("cl-err").textContent = c.error ?? "";
+  $("us-meta").textContent = c.imaging ? `${c.image_size?.[0] ?? ""}×${c.image_size?.[1] ?? ""}` : (c.connected ? "FROZEN" : "OFFLINE");
+  us.imaging = !!c.imaging;
+  $("us-run").textContent = c.imaging ? "FREEZE" : "RUN";
+  // Sliders follow the probe (its ranges and current values) unless you're adjusting them.
+  if (performance.now() > us.localUntil) {
+    for (const [name, value, range] of [["depth", c.depth_cm, c.depth_range], ["gain", c.gain, c.gain_range]]) {
+      const el = $(`us-${name}`);
+      if (range) { el.min = range[0]; el.max = range[1]; }
+      if (value != null) { el.value = value; $(`us-${name}-v`).textContent = (+value).toFixed(name === "depth" ? 1 : 0); }
+    }
+  }
+}
+
+for (const name of ["depth", "gain"]) {
+  const el = $(`us-${name}`);
+  el.addEventListener("input", () => {
+    us.localUntil = performance.now() + 1500;
+    $(`us-${name}-v`).textContent = (+el.value).toFixed(name === "depth" ? 1 : 0);
+    clearTimeout(us.sendTimer);
+    us.sendTimer = setTimeout(() => send({ cmd: "clarius_param", name, value: +el.value }), 120);
+  });
+}
+$("us-run").onclick = () => send({ cmd: "clarius_run", run: !us.imaging });
+
 // ───────────────────────────── views ─────────────────────────────
 const followTarget = new THREE.Vector3(0, 0.9, -2.5);
 function setView(kind) {
@@ -1075,6 +1133,8 @@ function onHello(msg) {
   buildRig(msg.cameras);
   buildSkeleton(msg);
   initDepthUI(msg.depth_limits ?? [0.2, 6.0]);
+  $("clarius").hidden = $("panel-us").hidden = !msg.clarius;
+  if (msg.clarius) $("cl-model").textContent = `CLARIUS ${msg.clarius.model} · ${msg.clarius.application.toUpperCase()}`;
   meshReady = false;
   if (msg.has_mesh) loadFaces();
   applyVisibility();
@@ -1084,6 +1144,7 @@ function onBinary(buf) {
   const head = new Uint8Array(buf, 0, 2);
   const kind = head[0], cam = head[1];
   if (kind === MSG_MESH) onMesh(buf);
+  else if (kind === MSG_ULTRASOUND) onUltrasound(buf);
   else if (kind === MSG_CLOUD) onCloud(cam, buf);
   else if (kind === MSG_JPEG) {
     const rc = rigCams[cam];
@@ -1105,6 +1166,7 @@ function onFrame(frame) {
   updateProbe(frame.probe);
   updateHud(frame);
   syncDepthUI(frame.depth_range);
+  updateClarius(frame.clarius);
   updateRigHealth(frame);
   // Keep the view centred on what matters: the subject, else the probe, else the scene.
   const focus = frame.person?.joints?.pelvis ?? (frame.probe?.tracked ? frame.probe.position : null);

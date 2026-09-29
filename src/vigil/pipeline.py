@@ -30,7 +30,7 @@ from .skeleton import BONES, JOINT_INDEX, JOINTS, LEG_JOINTS
 log = logging.getLogger(__name__)
 
 # Binary websocket messages: 8-byte header (u8 kind, u8 camera index, 2 pad, u32 seq).
-MSG_MESH, MSG_JPEG, MSG_CLOUD = 1, 2, 3
+MSG_MESH, MSG_JPEG, MSG_CLOUD, MSG_ULTRASOUND = 1, 2, 3, 4
 FUSED = 255  # camera index of the fused (world-frame) cloud
 
 # Leg segments the probe tip is measured against.
@@ -64,6 +64,9 @@ class Pipeline:
         self.status: dict = {"type": "status", "state": "starting", "message": "Starting…"}
         self.faces: bytes | None = None
         self._commands: queue.SimpleQueue[dict] = queue.SimpleQueue()
+        self.clarius = None
+        self.clarius_error: str | None = None
+        self._us_seq = -1
         # Display depth window (m) set from the dashboard; clouds, and optionally feeds,
         # only show pixels whose depth — from their own camera — falls inside it.
         self.depth_range = (cfg.cameras.depth_min_m, cfg.cameras.depth_max_m)
@@ -105,6 +108,15 @@ class Pipeline:
             estimator = build_estimator(self.cfg)
             if estimator.faces is not None:
                 self.faces = estimator.faces.astype("<u4").tobytes()
+            self.clarius = None
+            if self.cfg.clarius.enabled:
+                try:
+                    from .clarius import from_config
+
+                    self.clarius = from_config(self.cfg)
+                except Exception as e:  # the cameras keep working without the ultrasound
+                    log.warning("Clarius unavailable: %s", e)
+                    self.clarius_error = str(e)
             tracker = None
             if self.cfg.probe.enabled:
                 from .probe.tracker import ProbeTracker
@@ -131,6 +143,8 @@ class Pipeline:
             log.error("pipeline failed:\n%s", traceback.format_exc())
             self._set_status("error", _explain(e))
         finally:
+            if getattr(self, "clarius", None) is not None:
+                self.clarius.close()
             if body is not None:
                 body.stop()
             if detector is not None:
@@ -164,6 +178,8 @@ class Pipeline:
             "has_mesh": self.faces is not None,
             "probe": probe,
             "depth_limits": [self.cfg.cameras.depth_min_m, self.cfg.cameras.depth_max_m],
+            "clarius": {"model": self.cfg.clarius.model, "application": self.cfg.clarius.application}
+            if self.cfg.clarius.enabled else None,
         }
         self.publish(self.hello, [])
 
@@ -229,6 +245,15 @@ class Pipeline:
                 if fresh[rc.index]:
                     binaries.append(_pack(MSG_JPEG, rc.index, seq,
                                           self._preview(frames[rc.index])))
+            clarius = None
+            if self.clarius is not None:
+                us = self.clarius.snapshot()
+                clarius = us.json()
+                if us.image is not None and us.image_seq != self._us_seq:
+                    self._us_seq = us.image_seq
+                    binaries.append(_pack(MSG_ULTRASOUND, 0, seq, us.image))
+            elif self.clarius_error:
+                clarius = {"state": "unavailable", "error": self.clarius_error}
             # One fused cloud from every calibrated camera (world frame, de-duplicated);
             # uncalibrated cameras take turns sending their own until they're placed.
             if sc.point_cloud and seq % sc.point_cloud_every_n == 0:
@@ -264,6 +289,7 @@ class Pipeline:
                 "people": state.people,
                 "person": state.person,
                 "probe": probe,
+                "clarius": clarius,
                 "views": views,
                 "depth_range": {"min": self.depth_range[0], "max": self.depth_range[1],
                                 "mask_feeds": self.mask_feeds},
@@ -343,6 +369,10 @@ class Pipeline:
                     tracker.set_method(str(msg.get("method")))
                 elif cmd == "probe_reset" and tracker is not None:
                     tracker.filter.reset()
+                elif cmd == "clarius_param" and self.clarius is not None:
+                    self.clarius.set_param(str(msg.get("name")), float(msg.get("value")))
+                elif cmd == "clarius_run" and self.clarius is not None:
+                    self.clarius.set_running(bool(msg.get("run")))
                 elif cmd == "depth_range":
                     self._set_depth_range(msg)
                 elif cmd == "calibrate_rig":
@@ -350,7 +380,7 @@ class Pipeline:
                 elif cmd == "cancel_calibration" and calibrator is not None:
                     calibrator = None
                     self._calibration_result("cancelled", "Calibration cancelled.")
-            except ValueError as e:
+            except (ValueError, TypeError, KeyError) as e:  # a bad message must not stop the loop
                 log.warning("bad command %s: %s", msg, e)
 
     def _start_calibration(self, rig: Rig, tracker) -> RigCalibrator | None:

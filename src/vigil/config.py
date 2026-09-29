@@ -89,6 +89,18 @@ class ProbeConfig(_Strict):
     max_tag_error_px: float = 3.0  # tags that don't fit the others by this much are dropped
 
 
+class ClariusConfig(_Strict):
+    enabled: bool = True
+    sdk_path: Path = Path("third_party/solum/libsolum.so")
+    store_dir: Path = Path("third_party/solum/keys")
+    ip: str = "192.168.1.1"  # the probe's address on its own Wi-Fi access point
+    port: int | None = None  # control port; None = find it by scanning the probe
+    model: str = "PALHD3"
+    application: str = "msk"  # preset, e.g. msk, msk_knee, msk_hip, dvt, vascular
+    width: int = 640  # output image size
+    height: int = 480
+
+
 class SmoothingConfig(_Strict):
     enabled: bool = True
     min_cutoff: float = 1.5
@@ -117,6 +129,7 @@ class Config(_Strict):
     detector: DetectorConfig = DetectorConfig()
     estimator: EstimatorConfig = EstimatorConfig()
     probe: ProbeConfig = ProbeConfig()
+    clarius: ClariusConfig = ClariusConfig()
     smoothing: SmoothingConfig = SmoothingConfig()
     scene: SceneConfig = SceneConfig()
     server: ServerConfig = ServerConfig()

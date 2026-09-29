@@ -297,3 +297,23 @@ html, body {
 .rig-list .health.good { color: var(--ok); }
 .rig-list .health.fair { color: var(--warn); }
 .rig-list .health.poor { color: var(--err); }
+
+/* ───────────── clarius ───────────── */
+.clarius { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--faint); }
+.cl-head { display: flex; align-items: center; gap: 8px; font: 700 9.5px/1 var(--display); letter-spacing: 0.14em; }
+.cl-head #cl-state { margin-left: auto; font: 500 10px/1 var(--mono); letter-spacing: 0; color: var(--dim); text-align: right; }
+.cl-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+.cl-stats dt { font: 500 8px/1 var(--display); letter-spacing: 0.2em; color: var(--dim); }
+.cl-stats dd { margin: 4px 0 0; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.meter { display: block; height: 3px; margin-top: 4px; background: rgba(255, 255, 255, 0.08); }
+.meter b { display: block; height: 100%; width: 0; background: var(--ok); transition: width 0.3s; }
+#us-canvas { display: block; width: 100%; aspect-ratio: 4 / 3; background: #000; border: 1px solid var(--faint); }
+.us-ctl { display: grid; gap: 6px; margin-top: 8px; }
+.us-ctl label { display: grid; grid-template-columns: 46px 1fr 64px; align-items: center; gap: 8px;
+  font: 500 8.5px/1 var(--display); letter-spacing: 0.16em; color: var(--dim); }
+.us-ctl label b { font: 600 11px/1 var(--mono); color: var(--text); text-align: right; letter-spacing: 0; }
+.us-ctl input[type=range] { width: 100%; accent-color: var(--cyan); }
+.us-ctl button {
+  padding: 7px 0; cursor: pointer; font: 700 8.5px/1 var(--display); letter-spacing: 0.2em;
+  color: var(--cyan); background: rgba(34, 228, 255, 0.06); border: 1px solid rgba(34, 228, 255, 0.35);
+}
