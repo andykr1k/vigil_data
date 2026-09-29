@@ -52,7 +52,10 @@ class Hub:
         if self.loop is None:
             return
         bundle = (json.dumps(msg, separators=(",", ":")), binaries)
-        self.loop.call_soon_threadsafe(self._fanout, bundle, msg.get("type") == "frame")
+        try:
+            self.loop.call_soon_threadsafe(self._fanout, bundle, msg.get("type") == "frame")
+        except RuntimeError:
+            pass  # event loop already closed: the server is shutting down
 
     def _fanout(self, bundle: Bundle, droppable: bool) -> None:
         for c in self.clients:
@@ -71,6 +74,7 @@ def create_app(cfg: Config) -> FastAPI:
         pipeline.stop()
 
     app = FastAPI(title="Vigil", lifespan=lifespan)
+    app.state.pipeline = pipeline
 
     @app.get("/api/mesh/faces")
     def mesh_faces() -> Response:
@@ -111,15 +115,21 @@ def create_app(cfg: Config) -> FastAPI:
                     msg = json.loads(await socket.receive_text())
                 except (ValueError, TypeError):
                     continue
+                except (WebSocketDisconnect, RuntimeError):
+                    return  # client went away; the send loop notices via this task ending
                 if isinstance(msg, dict) and "cmd" in msg:
                     pipeline.command(msg)
 
         receiver = asyncio.create_task(receive())
         try:
             while True:
+                # Wake on new data *or* on the client going away, so a closed connection
+                # never keeps the handler (and server shutdown) waiting for the next frame.
+                ready = asyncio.create_task(client.ready.wait())
+                await asyncio.wait({ready, receiver}, return_when=asyncio.FIRST_COMPLETED)
                 if receiver.done():
+                    ready.cancel()
                     break
-                await client.ready.wait()
                 client.ready.clear()
                 while (bundle := client.pop()) is not None:
                     text, binaries = bundle

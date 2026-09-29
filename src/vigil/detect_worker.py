@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import signal
 import time
 from dataclasses import dataclass
 from multiprocessing import shared_memory
@@ -35,6 +36,9 @@ class Detections:
 
 def _detector_main(cfg: Config, frame_shms: list[tuple[str, int]], out_name: str,
                    ready: mp.Event, stop: mp.Event, errors: mp.Queue) -> None:
+    # Ctrl+C reaches the whole process group; the parent owns shutdown and stops us
+    # in order (dying here first would stall the parent's loops).
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     try:
         from .detector import PersonDetector

@@ -76,7 +76,8 @@ class Pipeline:
 
     def stop(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=10)
+        if self._thread.is_alive():
+            self._thread.join(timeout=15)
 
     def command(self, msg: dict) -> None:
         """Thread-safe: dashboard commands are applied at the top of the next iteration."""

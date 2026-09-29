@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import signal
 import queue
 import time
 from multiprocessing import shared_memory
@@ -90,6 +91,9 @@ def _camera_main(cfg: CamerasConfig, serial: str, shm_name: str, max_pixels: int
     """Child process: capture → temporal filter → align → shared memory."""
     from .camera import RealSenseCamera
 
+    # Ctrl+C reaches the whole process group; the parent owns shutdown and stops us
+    # in order (dying here first would stall the parent's loops).
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     buf = FrameBuffer(max_pixels, name=shm_name)
     try:

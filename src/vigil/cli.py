@@ -38,7 +38,18 @@ def cmd_run(args: argparse.Namespace) -> None:
     print(f"\n  Vigil dashboard → {url}\n"
           "  The server keeps running until Ctrl+C. First start compiles the pose model\n"
           "  (~30-40 s); the dashboard shows BOOTING until the cameras are live.\n")
-    uvicorn.run(create_app(cfg), host=host, port=port, log_level="info")
+    app = create_app(cfg)
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="info", timeout_graceful_shutdown=3)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # A terminal Ctrl+C reaches both `uv` and us, and uv forwards it: uvicorn sees a
+        # second SIGINT as "force quit" and skips the app's shutdown hook. Stop the
+        # pipeline here so cameras and worker processes are always released in order.
+        print("\n  Stopping cameras and workers…")
+        app.state.pipeline.stop()
+        print("  Stopped.")
 
 
 def cmd_setup(args: argparse.Namespace) -> None:
