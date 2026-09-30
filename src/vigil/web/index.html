@@ -140,7 +140,7 @@
     </section>
   </aside>
 
-  <!-- ───────────── top-right: display, cameras, sensor feeds ───────────── -->
+  <!-- ───────────── top-right: display, cameras, recording, sensor feeds ───────────── -->
   <aside class="hud hud-right">
     <section class="panel collapsible" id="panel-display">
       <header><span>DISPLAY</span><button class="chev" aria-label="Collapse"></button></header>
@@ -186,6 +186,34 @@
         <div class="depth-foot">
           <label class="toggle"><span>Mask feeds</span><input type="checkbox" id="depth-mask"><i></i></label>
           <button id="depth-reset">FULL RANGE</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel collapsible" id="panel-rec">
+      <header><span>RECORDING</span><span class="unit" id="rec-state">LIVE</span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body">
+        <div id="rec-live">
+          <div class="btn-row one"><button id="rec-toggle">● RECORD</button></div>
+          <p class="rig-msg" id="rec-msg"></p>
+          <h3 class="sub">RECORDINGS</h3>
+          <div class="rec-load">
+            <select id="rec-list" aria-label="Recordings"></select>
+            <button id="rec-replay">REPLAY</button>
+          </div>
+        </div>
+        <div id="rec-replay-ctl" hidden>
+          <div class="rp-name" id="rp-name"></div>
+          <input type="range" id="rp-seek" min="0" max="0" step="1" value="0" aria-label="Replay position">
+          <div class="rp-row">
+            <button id="rp-play">PAUSE</button>
+            <span id="rp-time">0:00 / 0:00</span>
+            <select id="rp-speed" aria-label="Replay speed">
+              <option value="0.25">0.25×</option><option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option>
+            </select>
+          </div>
+          <div class="btn-row one"><button id="rp-live">BACK TO LIVE</button></div>
         </div>
       </div>
     </section>

@@ -1114,7 +1114,7 @@ function connect() {
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
   socket = ws;
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { retry = 0; };
+  ws.onopen = () => { retry = 0; send({ cmd: "recordings" }); };
   ws.onclose = () => {
     setStatus("offline", "Pipeline unreachable — retrying…");
     setTimeout(connect, Math.min(500 * 2 ** retry++, 5000));
@@ -1125,6 +1125,8 @@ function connect() {
     if (msg.type === "hello") onHello(msg);
     else if (msg.type === "status") { setStatus(msg.state, msg.message); onBoot(msg); }
     else if (msg.type === "calibration") onCalibration(msg);
+    else if (msg.type === "recordings") onRecordings(msg.items);
+    else if (msg.type === "recording") $("rec-msg").textContent = msg.message;
     else if (msg.type === "frame") onFrame(msg);
   };
 }
@@ -1193,8 +1195,67 @@ function onBoot(msg) {
   }));
 }
 
+// ───────────────────────────── record / replay ─────────────────────────────
+const rec = { dragging: false, lastSeek: 0 };
+const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+function onRecordings(items) {
+  const list = $("rec-list"), keep = list.value;
+  list.replaceChildren(...items.map((r) => {
+    const o = document.createElement("option");
+    o.value = r.name;
+    const len = r.seconds == null ? "" : ` · ${mmss(r.seconds)} · ${Math.round(r.mb ?? 0)} MB`;
+    o.textContent = r.name + len;
+    return o;
+  }));
+  if (items.some((r) => r.name === keep)) list.value = keep;
+  $("rec-replay").disabled = !items.length;
+}
+
+function setReplayMode(on) {
+  $("rec-live").hidden = on;
+  $("rec-replay-ctl").hidden = !on;
+  $("rec-state").textContent = on ? "REPLAY" : "LIVE";
+  $("rec-state").style.color = on ? "var(--cyan)" : "";
+}
+
+function updateRecording(frame) {
+  const r = frame.recording, p = frame.replay;
+  if (p) {
+    $("rp-name").textContent = p.name;
+    const seek = $("rp-seek");
+    seek.max = p.count - 1;
+    if (!rec.dragging) seek.value = p.index;
+    $("rp-time").textContent = `${mmss(p.time)} / ${mmss(p.duration)}`;
+    $("rp-play").textContent = p.playing ? "PAUSE" : "PLAY";
+    $("rp-speed").value = String(p.speed);
+    return;
+  }
+  $("rec-toggle").textContent = r ? "■ STOP" : "● RECORD";
+  $("rec-toggle").classList.toggle("on", !!r);
+  $("rec-replay").disabled = !!r || !$("rec-list").childElementCount;
+  $("rec-state").textContent = r ? `REC ${mmss(r.seconds)}` : "LIVE";
+  $("rec-state").style.color = r ? "var(--err)" : "";
+  if (r) $("rec-msg").textContent = `${r.frames} frames · ${r.clouds} clouds · ${r.mb.toFixed(0)} MB` +
+    (r.dropped ? ` · ${r.dropped} dropped (disk too slow)` : "");
+}
+
+$("rec-toggle").onclick = () => send({ cmd: "record", on: !lastFrame?.recording });
+$("rec-replay").onclick = () => { if ($("rec-list").value) send({ cmd: "replay", name: $("rec-list").value }); };
+$("rp-live").onclick = () => send({ cmd: "replay_stop" });
+$("rp-play").onclick = () => send({ cmd: "replay_ctl", play: !lastFrame?.replay?.playing });
+$("rp-speed").onchange = (e) => send({ cmd: "replay_ctl", speed: +e.target.value });
+// Scrubbing: pause while dragging and show each position as the slider moves (throttled).
+$("rp-seek").oninput = (e) => {
+  if (!rec.dragging) { rec.dragging = true; send({ cmd: "replay_ctl", play: false }); }
+  const now = performance.now();
+  if (now - rec.lastSeek > 50) { rec.lastSeek = now; send({ cmd: "replay_ctl", seek: +e.target.value }); }
+};
+$("rp-seek").onchange = (e) => { rec.dragging = false; send({ cmd: "replay_ctl", seek: +e.target.value }); };
+
 function onHello(msg) {
   hello = msg;
+  setReplayMode(!!msg.replay);
   $("stat-backend").textContent = msg.backend === "sam3d_body" ? "SAM3D-B" : "VITPOSE+D";
   $("stat-backend").title = msg.backend;
   if (!probeState.info || JSON.stringify(probeState.info) !== JSON.stringify(msg.probe)) buildProbe(msg.probe);
@@ -1237,6 +1298,7 @@ function onFrame(frame) {
   syncDepthUI(frame.depth_range);
   updateClarius(frame.clarius);
   updateRigHealth(frame);
+  updateRecording(frame);
   // Keep the view centred on what matters: the subject, else the probe, else the scene.
   const focus = frame.person?.joints?.pelvis ?? (frame.probe?.tracked ? frame.probe.position : null);
   if (focus) {

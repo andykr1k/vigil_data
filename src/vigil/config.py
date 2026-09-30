@@ -120,6 +120,13 @@ class SceneConfig(_Strict):
     floor_every_n: int = 15
 
 
+class RecordingConfig(_Strict):
+    dir: Path = Path("recordings")
+    color_format: Literal["jpg", "png"] = "jpg"  # png = lossless, ~5x larger and slower
+    jpeg_quality: int = 95
+    writers: int = 4  # threads encoding and writing files
+
+
 class ServerConfig(_Strict):
     host: str = "127.0.0.1"
     port: int = 8000
@@ -135,6 +142,7 @@ class Config(_Strict):
     clarius: ClariusConfig = ClariusConfig()
     smoothing: SmoothingConfig = SmoothingConfig()
     scene: SceneConfig = SceneConfig()
+    recording: RecordingConfig = RecordingConfig()
     server: ServerConfig = ServerConfig()
 
     def resolve(self, path: Path) -> Path:

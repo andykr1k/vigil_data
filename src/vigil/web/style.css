@@ -393,3 +393,22 @@ html, body {
 .us-feed[hidden] { display: none; }
 .us-ctl :disabled { opacity: 0.35; cursor: not-allowed; }
 .probe-fit .warn { color: var(--warn); }
+
+/* ───────────── recording / replay ───────────── */
+#rec-live[hidden], #rec-replay-ctl[hidden] { display: none; }
+#rec-toggle.on { color: var(--err); border-color: var(--err); box-shadow: 0 0 12px rgba(255, 77, 106, 0.35);
+  animation: pulse 1.2s ease-in-out infinite; }
+.rec-load { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
+.rec-load select, .rp-row select {
+  min-width: 0; padding: 5px 6px; background: rgba(0, 0, 0, 0.35); color: var(--text);
+  border: 1px solid var(--panel-edge); border-radius: 3px; font: 10.5px var(--mono);
+}
+.rec-load button, .rp-row button {
+  padding: 5px 10px; background: rgba(34, 228, 255, 0.06); color: var(--cyan); cursor: pointer;
+  border: 1px solid var(--panel-edge); border-radius: 3px; font: 600 9px/1 var(--display); letter-spacing: 0.15em;
+}
+.rec-load button:disabled { opacity: 0.35; cursor: default; }
+.rp-name { color: var(--dim); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#rp-seek { width: 100%; margin: 10px 0 8px; accent-color: var(--cyan); }
+.rp-row { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; margin-bottom: 8px; }
+.rp-row span { text-align: center; font-variant-numeric: tabular-nums; }

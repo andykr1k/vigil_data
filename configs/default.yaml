@@ -112,6 +112,14 @@ scene:
   floor_max_tilt_deg: 75   # cameras can look steeply down
   floor_every_n: 15
 
+recording:
+  # RECORDING box in the dashboard: RealSense colour + aligned depth, the fused point cloud
+  # (PLY), probe pose, body joints and ultrasound, replayable in the dashboard. See README.
+  dir: recordings
+  color_format: jpg        # jpg | png (lossless, ~5x larger)
+  jpeg_quality: 95
+  writers: 4
+
 server:
   host: 127.0.0.1
   port: 8000

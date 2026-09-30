@@ -82,6 +82,20 @@ With 2+ calibrated cameras, each joint whose 2D keypoint is confident in at leas
 
 **Floor:** the lowest large horizontal surface in the world camera's cloud (seats and tables are horizontal too), tracked over time. A different plane replaces it only after three consistent fits, and it works with cameras looking steeply down (up to 75°).
 
+## Recording and replay
+
+The **RECORDING** box records everything to `recordings/<date>_<procedure>/`, in formats other tools open directly:
+
+- `cloud/*.ply`: the fused point cloud (world frame, metres, RGB, binary PLY), for CloudCompare, MeshLab, Blender, Open3D or PCL.
+- `cam<i>/color/*.jpg` and `cam<i>/depth/*.png`: each RealSense's colour image, plus depth as uint16 millimetres aligned to it (the TUM / Open3D RGB-D convention).
+- `meta.json`: intrinsics and `T_world_camera` per camera. `frames.jsonl`: per-frame timestamps, probe pose and tip, and body joints.
+- `ultrasound/*.jpg`: the Clarius frames.
+- Each recording has a `README.txt` with an Open3D example.
+
+Files share one frame number, so a frame's images, cloud, probe pose and ultrasound line up. Writes run on a thread pool. If the disk can't keep up, frames are dropped (and counted) rather than slowing the live view. That's about 60 MB/s for two cameras.
+
+**REPLAY** plays a recording back through the dashboard in place of live data: 3D scene, point cloud, skeleton, probe, camera feeds and ultrasound. It has play/pause, speed, and a slider for scrubbing. **BACK TO LIVE** returns to the cameras.
+
 ## Configuration
 
 - `configs/default.yaml` holds all tunables: cameras and stream modes, depth filters, detector and person selection, procedures (probe preset per procedure), backend options, probe geometry and filter, smoothing, point cloud and floor detection, server.
@@ -117,6 +131,8 @@ src/vigil/
   rig.py                  multi-camera world frame, extrinsics file, rig calibration
   detector.py             transformers RT-DETR person detector
   detect_worker.py        detector in its own process (reads camera shared memory)
+  recorder.py             session recording (PLY clouds, RGB-D, meta, per-frame JSONL)
+  replay.py               replays a recording through the dashboard protocol
   startup.py              startup checklist, progress and time left for the dashboard
   body.py                 body thread: subject tracking, batched pose, triangulation, smoothing
   estimators/             sam3d_body.py, vitpose_depth.py (compiled, batched)
@@ -130,7 +146,7 @@ src/vigil/
   web/                    index.html, style.css, app.js (three.js from CDN)
 ```
 
-Websocket protocol: JSON `hello` / `status` / `calibration` / `frame` messages from the server, and `{"cmd": ...}` from the dashboard (`start` with the chosen procedure, `probe_filter`, `probe_reset`, `calibrate_rig`, `cancel_calibration`, `depth_range`). Binary messages have an 8-byte header (`u8 kind, u8 camera, 2 pad, u32 seq`): kind 1 is mesh vertices (int16 mm), 2 is a JPEG preview, 3 is a point cloud (int16 mm xyz + rgb, in that camera's frame). Other coordinates are in the world frame: the first camera's color optical frame (x right, y down, z forward, metres).
+Websocket protocol: JSON `hello` / `status` / `calibration` / `frame` messages from the server, and `{"cmd": ...}` from the dashboard (`start` with the chosen procedure, `probe_filter`, `probe_reset`, `calibrate_rig`, `cancel_calibration`, `depth_range`, `record`, `recordings`, `replay`, `replay_ctl`, `replay_stop`). Binary messages have an 8-byte header (`u8 kind, u8 camera, 2 pad, u32 seq`): kind 1 is mesh vertices (int16 mm), 2 is a JPEG preview, 3 is a point cloud (int16 mm xyz + rgb, in that camera's frame). Other coordinates are in the world frame: the first camera's color optical frame (x right, y down, z forward, metres).
 
 ## Performance notes (RTX 3090, 848×480)
 

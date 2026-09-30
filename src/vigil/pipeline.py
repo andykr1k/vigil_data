@@ -62,6 +62,9 @@ class Pipeline:
         self.region = REGIONS["lower_limb"]  # its body target (leg or chest)
         self._chosen = threading.Event()
         self._us_seq = -1
+        self.recorder = None  # recorder.Recorder while recording
+        self.player = None  # replay.Player while replaying (live frames aren't sent)
+        self._live_hello: dict | None = None
         # Display depth window (m) set from the dashboard; clouds, and optionally feeds,
         # only show pixels whose depth — from their own camera — falls inside it.
         self.depth_range = (cfg.cameras.depth_min_m, cfg.cameras.depth_max_m)
@@ -189,6 +192,10 @@ class Pipeline:
         finally:
             if startup is not None:
                 startup.close()
+            if self.player is not None:
+                self.player.close()
+            if self.recorder is not None:
+                self.recorder.close()
             if getattr(self, "clarius", None) is not None:
                 self.clarius.close()
             if body is not None:
@@ -233,7 +240,7 @@ class Pipeline:
                            for m in g.mounts.values()],
                 "method": tracker.filter.method,
             }
-        self.hello = {
+        hello = {
             "type": "hello",
             "backend": backend,
             "cameras": [rc.describe() for rc in rig.cameras],
@@ -248,7 +255,10 @@ class Pipeline:
             "clarius": {"model": self.cfg.clarius.model, "application": self.application}
             if self.cfg.clarius.enabled else None,
         }
-        self.publish(self.hello, [])
+        self._live_hello = hello
+        if self.player is None:
+            self.hello = hello
+            self.publish(hello, [])
 
     # ------------------------------------------------------------------ loop
     def _loop(self, rig: Rig, body, backend: str, tracker) -> None:
@@ -313,12 +323,13 @@ class Pipeline:
                 if fresh[rc.index]:
                     binaries.append(_pack(MSG_JPEG, rc.index, seq,
                                           self._preview(frames[rc.index])))
-            clarius = None
+            clarius, us_new = None, None
             if self.clarius is not None:
                 us = self.clarius.snapshot()
                 clarius = us.json()
                 if us.image is not None and us.image_seq != self._us_seq:
                     self._us_seq = us.image_seq
+                    us_new = us.image
                     binaries.append(_pack(MSG_ULTRASOUND, 0, seq, us.image))
             elif self.clarius_error:
                 clarius = {"state": "unavailable", "error": self.clarius_error}
@@ -337,6 +348,8 @@ class Pipeline:
                     clouds.offer((FUSED, list(frames), calibrated))
             if (cloud := clouds.take()) is not None:
                 binaries.append(_pack(MSG_CLOUD, cloud[0], seq, cloud[1]))
+                if self.recorder is not None:
+                    self.recorder.add_cloud(seq, None if cloud[0] == FUSED else cloud[0], *cloud[2:])
             if sc.floor_detection and (floor is None or seq % sc.floor_every_n == 0):
                 xyz, _ = self._cloud(frames[0], rig.world, full_range=True, stride=4)
                 floor = floor_estimate.update(fit_floor(xyz, sc.floor_max_tilt_deg))
@@ -367,7 +380,11 @@ class Pipeline:
                 "floor": None if floor is None else {
                     "normal": [float(v) for v in floor[0]], "height": round(floor[1], 4)},
             }
-            self.publish(msg, binaries)
+            if self.recorder is not None:
+                self.recorder.add_frame(seq, frames, fresh, {"t": f0.timestamp, "frame": msg}, us_new)
+                msg = dict(msg, recording=self.recorder.status())
+            if self.player is None:  # while replaying, the dashboard shows the recording
+                self.publish(msg, binaries)
 
     # ------------------------------------------------------------------ probe
     def _track_probe(self, rig: Rig, frames, fresh, tracker, timestamp: float):
@@ -444,13 +461,79 @@ class Pipeline:
                     self.clarius.set_running(bool(msg.get("run")))
                 elif cmd == "depth_range":
                     self._set_depth_range(msg)
+                elif cmd == "record":
+                    self._record(rig, bool(msg.get("on")))
+                elif cmd == "recordings":
+                    self._list_recordings()
+                elif cmd == "replay":
+                    self._replay(str(msg.get("name", "")))
+                elif cmd == "replay_ctl" and self.player is not None:
+                    self.player.control(msg)
+                elif cmd == "replay_stop":
+                    self._replay(None)
                 elif cmd == "calibrate_rig":
                     calibrator = self._start_calibration(rig, tracker)
                 elif cmd == "cancel_calibration" and calibrator is not None:
                     calibrator = None
                     self._calibration_result("cancelled", "Calibration cancelled.")
-            except (ValueError, TypeError, KeyError) as e:  # a bad message must not stop the loop
+            except (ValueError, TypeError, KeyError, OSError) as e:  # a bad message must not stop the loop
                 log.warning("bad command %s: %s", msg, e)
+
+    # ------------------------------------------------------------------ record / replay
+    def _record(self, rig: Rig, on: bool) -> None:
+        from .recorder import Recorder
+
+        if on and self.recorder is None and self.player is None:
+            cams = [dict(rc.describe(), dist=list(rc.camera.intrinsics.coeffs)) for rc in rig.cameras]
+            self.recorder = Recorder(
+                self.cfg.recording, self.cfg.resolve(self.cfg.recording.dir), cams,
+                {"procedure": self.procedure, "application": self.application,
+                 "world_frame": "camera 1 colour optical frame (x right, y down, z forward)",
+                 "depth_window": list(self.depth_range), "hello": self._live_hello})
+            self._recording_msg("recording", f"Recording to {self.recorder.path}")
+        elif not on and self.recorder is not None:
+            rec, self.recorder = self.recorder, None
+
+            def finish():  # flushing queued writes can take a moment: off the loop
+                s = rec.close()
+                self._recording_msg("saved", f"Saved {s['seconds']:.0f} s, {s['frames']} frames, "
+                                    f"{s['mb']:.0f} MB ({s['dropped']} dropped) to {s['path']}")
+                self._list_recordings()
+
+            threading.Thread(target=finish, name="rec-close", daemon=True).start()
+
+    def _recording_msg(self, state: str, message: str) -> None:
+        log.info("[recording] %s", message)
+        self.publish({"type": "recording", "state": state, "message": message}, [])
+
+    def _list_recordings(self) -> None:
+        from .replay import list_recordings
+
+        root = self.cfg.resolve(self.cfg.recording.dir)
+        self.publish({"type": "recordings", "items": list_recordings(root) if root.is_dir() else []}, [])
+
+    def _replay(self, name: str | None) -> None:
+        """Start replaying a recording (by folder name), or go back to live (None)."""
+        from .replay import Player
+
+        if self.player is not None:
+            self.player.close()
+            self.player = None
+        if name:
+            if self.recorder is not None:
+                self._record(None, False)
+            root = self.cfg.resolve(self.cfg.recording.dir)
+            path = (root / name).resolve()
+            if path.parent != root.resolve() or not (path / "meta.json").is_file():
+                raise ValueError(f"no recording named {name!r}")
+            player = Player(path, self.publish)
+            self.hello = dict(player.hello, replay=True)
+            self.publish(self.hello, [])
+            self.player = player
+            player.start()
+        elif self._live_hello is not None:
+            self.hello = self._live_hello
+            self.publish(self.hello, [])
 
     def _start_calibration(self, rig: Rig, tracker) -> RigCalibrator | None:
         if tracker is None:
@@ -508,14 +591,15 @@ class Pipeline:
         return point_cloud(frame.color, frame.depth, rc.camera.intrinsics,
                            stride or sc.point_cloud_stride, lo, hi)
 
-    def _cloud_message(self, job) -> tuple[int, bytes]:
-        """(camera id, payload): one camera's own cloud, or the fused cloud (cam = FUSED)."""
+    def _cloud_message(self, job) -> tuple[int, bytes, np.ndarray, np.ndarray]:
+        """(camera id, payload, xyz, rgb): one camera's own cloud, or the fused cloud
+        (cam = FUSED)."""
         cam, frames, cams = job
         if cam == FUSED:
             xyz, rgb = self._fused_cloud(frames, cams)
         else:
             xyz, rgb = self._cloud(frames[cam], cams[0])
-        return cam, struct.pack("<I", len(xyz)) + _mm(xyz) + rgb.tobytes()
+        return cam, struct.pack("<I", len(xyz)) + _mm(xyz) + rgb.tobytes(), xyz, rgb
 
     def _fused_cloud(self, frames, cams: list[RigCamera]) -> tuple[np.ndarray, np.ndarray]:
         """All calibrated cameras' clouds in the world frame, one point per voxel."""
