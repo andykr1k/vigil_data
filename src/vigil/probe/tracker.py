@@ -3,6 +3,13 @@
 Per frame: detect tags in every camera → clean each view (outlier tags, single-tag flips
 resolved against the previous pose) → fuse the calibrated views into an initial world
 pose → refine jointly over every corner in every camera plus measured depth → filter.
+
+A joint solve is only as good as the rig calibration: if the cameras have moved since, they
+disagree about where the cube is, and the compromise shifts every time the visible tags
+change (centimetres of tip jitter). When the joint fit shows that, the probe is tracked from
+one camera — kept while it sees the probe, since switching cameras jumps by the calibration
+error — and the dashboard is told to recalibrate. Depth that disagrees with the tags
+(misaligned depth, background hits) is dropped the same way.
 """
 
 from __future__ import annotations
@@ -26,6 +33,11 @@ from .solver import CameraView, CleanView, Refined, clean_view, refine_multiview
 
 log = logging.getLogger(__name__)
 
+# Cameras that place the cube this far apart disagree (stale rig calibration), even when a
+# joint solve hides it by sliding the cube along the rays. A single tag's orientation is
+# ambiguous, so a camera seeing one tag is only compared by position, more loosely.
+RIG_MAX_OFFSET_M, RIG_MAX_ANGLE_DEG, RIG_MAX_OFFSET_1TAG_M = 0.015, 4.0, 0.03
+
 
 @dataclass
 class ProbeInput:
@@ -47,6 +59,7 @@ class ProbeFrame:
     cam_poses: dict[str, ObjectPose] = field(default_factory=dict)  # per camera, camera frame
     world_poses: dict[str, ObjectPose] = field(default_factory=dict)  # per calibrated camera
     refined: Refined | None = None
+    rig_error_px: float | None = None  # joint fit when the cameras disagree (→ recalibrate)
 
 
 def _to_h(p: ObjectPose) -> np.ndarray:
@@ -69,6 +82,7 @@ class ProbeTracker:
         self._frame = 0
         self.filter = ObjectPoseFilter()
         self._last: ObjectPose | None = None
+        self._source: str | None = None  # the one camera used while the rig disagrees
         preset = cfg.resolve(pc.filter_preset)
         if preset.is_file():
             try:
@@ -173,17 +187,43 @@ class ProbeTracker:
         init = fuse_poses(list(out.world_poses.values()))
         measured = init
         if init is not None and self.cfg.joint_solve:
-            views = [CameraView(c.T_world_cam, c.K, c.dist, out.views[c.serial].markers,
-                                c.depth if self.cfg.use_depth else None)
+            views = {c.serial: CameraView(c.T_world_cam, c.K, c.dist, out.views[c.serial].markers,
+                                          c.depth if self.cfg.use_depth else None)
                      for c in inputs
-                     if c.T_world_cam is not None and c.serial in out.world_poses]
-            out.refined = refine_multiview(views, self.geometry, init, use_depth=self.cfg.use_depth)
+                     if c.T_world_cam is not None and c.serial in out.world_poses}
+            out.refined = self._refine(list(views.values()), init)
+            if out.refined is not None and len(views) > 1 and (
+                    out.refined.rms_px > self.cfg.max_rig_error_px
+                    or self._views_disagree(views, out.world_poses)):
+                out.rig_error_px = out.refined.rms_px
+                if self._source not in views:  # the camera that sees the most tags
+                    self._source = max(views, key=lambda s: len(views[s].markers))
+                out.refined = self._refine([views[self._source]], out.world_poses[self._source])
             if out.refined is not None:
                 measured = out.refined.pose
         out.measured = measured
         out.estimate = self.filter.update(measured, timestamp)
         self._last = out.estimate or measured
         return out
+
+    @staticmethod
+    def _views_disagree(views: dict[str, CameraView], poses: dict[str, ObjectPose]) -> bool:
+        seen = [(poses[s], len(v.markers) >= 2) for s, v in views.items()]
+        for i, (a, a_solid) in enumerate(seen):
+            for b, b_solid in seen[i + 1:]:
+                d = np.linalg.norm(a.position - b.position)
+                if a_solid and b_solid:
+                    if d > RIG_MAX_OFFSET_M or _angle_deg(a.rotation_matrix, b.rotation_matrix) > RIG_MAX_ANGLE_DEG:
+                        return True
+                elif d > RIG_MAX_OFFSET_1TAG_M:
+                    return True
+        return False
+
+    def _refine(self, views: list[CameraView], init: ObjectPose) -> Refined | None:
+        r = refine_multiview(views, self.geometry, init, use_depth=self.cfg.use_depth)
+        if r is not None and r.depth_samples and r.depth_rms_mm > self.cfg.max_depth_error_mm:
+            r = refine_multiview(views, self.geometry, init, use_depth=False)
+        return r
 
     def set_method(self, method: str) -> None:
         if method not in FILTER_METHODS:

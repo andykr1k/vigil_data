@@ -199,7 +199,7 @@ const dust = (() => {
 scene.add(dust);
 
 // ───────────────────────────── cameras (rig) ─────────────────────────────
-const CLOUD_MAX = 200_000;
+const CLOUD_MAX = 400_000;
 let rigCams = []; // per camera: { info, group, cloud, feed, image }
 
 function makeSensorGlyph(cam, highlight, calibrated) {
@@ -280,7 +280,7 @@ function makeCloud(color) {
   geo.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(CLOUD_MAX * 3), 3, true).setUsage(THREE.DynamicDrawUsage));
   geo.setDrawRange(0, 0);
   const cloud = new THREE.Points(geo, new THREE.PointsMaterial({
-    size: 0.014, vertexColors: true, transparent: true, opacity: 0.8, depthWrite: false, color }));
+    size: 0.008, vertexColors: true, transparent: true, opacity: 0.85, depthWrite: false, color }));
   cloud.frustumCulled = false;
   return cloud;
 }
@@ -292,9 +292,9 @@ function onCloud(cam, buf) {
   const cloud = cam === FUSED ? fusedCloud : rigCams[cam]?.cloud;
   if (!cloud) return;
   const geo = cloud.geometry;
-  const n = Math.min(new DataView(buf).getUint32(8, true), CLOUD_MAX);
+  const total = new DataView(buf).getUint32(8, true), n = Math.min(total, CLOUD_MAX);
   const xyz = new Int16Array(buf, 12, n * 3);
-  const rgb = new Uint8Array(buf, 12 + n * 6, n * 3);
+  const rgb = new Uint8Array(buf, 12 + total * 6, n * 3);
   const pos = geo.attributes.position.array, col = geo.attributes.color.array;
   for (let i = 0; i < n * 3; i++) pos[i] = xyz[i] * 0.001;
   col.set(rgb);
@@ -384,7 +384,7 @@ function sideOf(name) {
 function buildSkeleton(hello) {
   if (skel) removeWithLabels(skel.group);
   const group = new THREE.Group();
-  const legSet = new Set(hello.leg_joints);
+  const legSet = new Set(hello.focus_joints); // the procedure's target: leg or chest
   const joints = {};
   const sphere = new THREE.SphereGeometry(1, 20, 14);
   for (const name of hello.joints) {
@@ -403,7 +403,7 @@ function buildSkeleton(hello) {
   }
   const cyl = new THREE.CylinderGeometry(1, 1, 1, 10, 1, true);
   const bones = hello.bones.map(([a, b]) => {
-    const leg = legSet.has(a) && legSet.has(b) && !(a === "pelvis" && b === "neck");
+    const leg = legSet.has(a) && legSet.has(b) && !(hello.region === "leg" && a === "pelvis" && b === "neck");
     const s = sideOf(b) === "center" ? sideOf(a) : sideOf(b);
     const color = leg ? COLORS[s] : COLORS.upper;
     const m = new THREE.Mesh(cyl, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: leg ? 0.95 : 0.55 }));
@@ -619,7 +619,10 @@ function updateProbe(probe) {
   const fit = probe.fit;
   $("probe-fit").innerHTML = fit
     ? `FIT <b>${fit.rms_px.toFixed(2)} px</b> · ${fit.corners} corners` +
-      (fit.depth_samples ? ` · depth <b>±${fit.depth_rms_mm?.toFixed(0) ?? "—"} mm</b>` : "")
+      (fit.depth_samples ? ` · depth <b>±${fit.depth_rms_mm?.toFixed(0) ?? "—"} mm</b>` : "") +
+      (fit.rig_error_px != null
+        ? `<br><span class="warn">CAMERAS DISAGREE ${fit.rig_error_px.toFixed(0)} px · ONE CAMERA IN USE — CALIBRATE RIG</span>`
+        : "")
     : "";
   $("probe-cams").textContent = probe.tracked ? `${probe.cameras} CAM${probe.cameras === 1 ? "" : "S"}` : "";
   panel.textContent = probe.tracked ? "TRACKED" : "SEARCHING";
@@ -720,13 +723,14 @@ function updateHud(frame) {
   fpsCell("stat-fps", frame.fps);
   fpsCell("stat-body-fps", frame.body_fps);
   $("stat-latency").textContent = `${frame.latency_ms.toFixed(0)} ms`;
-  const age = frame.timings.detection_age_ms;
-  $("stat-detect").textContent = age == null ? "—" : `${age} ms`;
   $("stat-pose").textContent = `${frame.timings.pose_ms.toFixed(0)} ms`;
   $("stat-probe").textContent = `${frame.timings.probe_ms.toFixed(0)} ms`;
+  const age = frame.timings.detection_age_ms;
+  $("stat-detect").textContent = age == null ? "—" : `${age} ms`;
   $("stat-people").textContent = frame.people;
   const subj = $("subject-state");
-  subj.textContent = frame.person ? "SUBJECT LOCK" : "NO SUBJECT";
+  const target = (hello?.region ?? "subject").toUpperCase();
+  subj.textContent = frame.person ? `${target} LOCK` : `NO ${target}`;
   subj.classList.toggle("on", !!frame.person);
 
   for (const v of frame.views) {
@@ -822,7 +826,7 @@ function drawFeed(rc) {
   }
   const K = view.kp2d;
   if (K) {
-    const legSet = new Set(hello?.leg_joints ?? []);
+    const legSet = new Set(hello?.focus_joints ?? []);
     for (const [a, b] of hello?.bones ?? []) {
       if (!K[a] || !K[b]) continue;
       const leg = legSet.has(a) && legSet.has(b);
@@ -880,7 +884,6 @@ function renderRigList() {
     list.appendChild(li);
   }
   $("rig-meta").textContent = `${rigCams.length} CAM${rigCams.length === 1 ? "" : "S"}`;
-  $("stat-cams").textContent = rigCams.length;
   const calBtn = $("rig-calibrate");
   calBtn.disabled = rigCams.length < 2 || !probeState.info;
   calBtn.title = rigCams.length < 2 ? "Connect a second camera to calibrate the rig" : "";
@@ -1032,6 +1035,7 @@ function updateClarius(c) {
   $("us-meta").textContent = c.imaging ? `${c.image_size?.[0] ?? ""}×${c.image_size?.[1] ?? ""}` : (c.connected ? "FROZEN" : "OFFLINE");
   us.imaging = !!c.imaging;
   $("us-run").textContent = c.imaging ? "FREEZE" : "RUN";
+  for (const id of ["us-depth", "us-gain", "us-run"]) $(id).disabled = !c.connected; // nothing to control yet
   // Sliders follow the probe (its ranges and current values) unless you're adjusting them.
   if (performance.now() > us.localUntil) {
     for (const [name, value, range] of [["depth", c.depth_cm, c.depth_range], ["gain", c.gain, c.gain_range]]) {
@@ -1119,10 +1123,74 @@ function connect() {
     if (typeof ev.data !== "string") return onBinary(ev.data);
     const msg = JSON.parse(ev.data);
     if (msg.type === "hello") onHello(msg);
-    else if (msg.type === "status") setStatus(msg.state, msg.message);
+    else if (msg.type === "status") { setStatus(msg.state, msg.message); onBoot(msg); }
     else if (msg.type === "calibration") onCalibration(msg);
     else if (msg.type === "frame") onFrame(msg);
   };
+}
+
+// ───────────────────────────── startup overlay ─────────────────────────────
+const PROC_ICONS = {
+  cardiac: '<path d="M16 27 C6 20 3 14 3 10 A6.5 6.5 0 0 1 16 8 A6.5 6.5 0 0 1 29 10 C29 14 26 20 16 27 Z"/><path d="M6 15 H11 L13 11 L16 19 L18 14 H26"/>',
+  lower_limb: '<path d="M12 3 L13 13 L11 22 L11 27 L19 29"/><path d="M19 3 L18 13 L17 22 L18 25"/><circle cx="12.5" cy="13" r="1.6"/>',
+};
+const CHECK_ICONS = { pending: "○", active: "", done: "✓", warn: "!", error: "✕" };
+let bootState = null;
+
+function onBoot(msg) {
+  const boot = $("boot"), prev = bootState;
+  bootState = msg.state;
+  const show = msg.state === "select" || msg.state === "loading" || (msg.state === "error" && msg.checks);
+  if (!show) {
+    if (!boot.hidden && !boot.classList.contains("leaving")) {
+      boot.classList.add("leaving"); // fade out once everything is up
+      setTimeout(() => { boot.hidden = true; boot.classList.remove("leaving"); }, 600);
+    }
+    return;
+  }
+  boot.hidden = false;
+  const selecting = msg.state === "select";
+  $("boot-choices").hidden = !selecting;
+  $("boot-progress").hidden = selecting;
+  if (selecting) {
+    $("boot-sub").textContent = "SELECT PROCEDURE";
+    const box = $("boot-choices");
+    if (prev !== "select") {
+      box.replaceChildren(); // fresh buttons each time the server asks
+      for (const p of msg.procedures) {
+        const b = document.createElement("button");
+        b.className = "boot-choice";
+        b.innerHTML = `<svg viewBox="0 0 32 32" aria-hidden="true">${PROC_ICONS[p.id] ?? ""}</svg>` +
+          `<span class="name">${p.label}</span><span class="preset">PROBE PRESET · ${p.application.toUpperCase()}</span>`;
+        b.onclick = () => {
+          box.querySelectorAll("button").forEach((x) => (x.disabled = true));
+          b.classList.add("picked");
+          send({ cmd: "start", procedure: p.id });
+        };
+        box.append(b);
+      }
+    }
+    return;
+  }
+  $("boot-sub").textContent = `${(msg.procedure ?? "").toUpperCase()} · ${msg.state === "error" ? "STARTUP FAILED" : "INITIALISING"}`;
+  if (msg.progress != null) {
+    const pct = Math.round(msg.progress * 100);
+    $("boot-bar").style.width = `${pct}%`;
+    $("boot-pct").textContent = `${pct}%`;
+    const s = Math.ceil(msg.eta_s);
+    $("boot-eta").textContent = s <= 0 ? "finishing…" : `~${s >= 60 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : `${s} s`} left`;
+  }
+  $("boot").classList.toggle("failed", msg.state === "error");
+  $("boot-err").hidden = msg.state !== "error";
+  $("boot-err").textContent = msg.state === "error" ? msg.message : "";
+  $("boot-checks").replaceChildren(...(msg.checks ?? []).map((c) => {
+    const li = document.createElement("li");
+    li.className = c.state;
+    li.innerHTML = `<span class="ico">${CHECK_ICONS[c.state] ?? ""}</span><span class="lbl"></span><span class="det"></span>`;
+    li.querySelector(".lbl").textContent = c.label;
+    li.querySelector(".det").textContent = c.detail;
+    return li;
+  }));
 }
 
 function onHello(msg) {
@@ -1133,6 +1201,7 @@ function onHello(msg) {
   buildRig(msg.cameras);
   buildSkeleton(msg);
   initDepthUI(msg.depth_limits ?? [0.2, 6.0]);
+  $("panel-angles").hidden = msg.region !== "leg"; // joint angles are a lower-limb measure
   $("clarius").hidden = $("panel-us").hidden = !msg.clarius;
   if (msg.clarius) $("cl-model").textContent = `CLARIUS ${msg.clarius.model} · ${msg.clarius.application.toUpperCase()}`;
   meshReady = false;

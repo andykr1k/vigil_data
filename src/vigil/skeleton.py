@@ -1,6 +1,9 @@
-"""Canonical joint set shared by all backends and the dashboard, plus leg joint angles."""
+"""Canonical joint set shared by all backends and the dashboard, the body region each
+procedure targets (leg or chest), and leg joint angles."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -16,6 +19,7 @@ JOINTS: list[str] = [
     "left_heel", "right_heel",
     "left_big_toe", "right_big_toe",
     "left_small_toe", "right_small_toe",
+    "chest",  # centre of the chest (cardiac), derived from shoulders and hips
 ]
 JOINT_INDEX = {name: i for i, name in enumerate(JOINTS)}
 
@@ -38,7 +42,36 @@ BONES: list[tuple[str, str]] = [
     ("neck", "left_shoulder"), ("neck", "right_shoulder"),
     ("left_shoulder", "left_elbow"), ("right_shoulder", "right_elbow"),
     ("left_elbow", "left_wrist"), ("right_elbow", "right_wrist"),
+    # torso outline (the chest)
+    ("left_shoulder", "right_shoulder"),
+    ("left_shoulder", "left_hip"), ("right_shoulder", "right_hip"),
 ]
+
+CHEST_JOINTS = ["neck", "left_shoulder", "right_shoulder", "chest", "pelvis", "left_hip", "right_hip"]
+
+
+@dataclass(frozen=True)
+class Region:
+    """What a procedure tracks: the joints highlighted, the anchor joint used to tell views
+    of the same body apart, and the segments the probe tip is measured to."""
+    name: str
+    joints: list[str]
+    anchor: str
+    segments: dict[str, tuple[str, str]]
+
+
+REGIONS = {
+    "lower_limb": Region(
+        "leg", LEG_JOINTS, "pelvis",
+        {f"{side}_{name}": (f"{side}_{a}", f"{side}_{b}")
+         for side in ("left", "right")
+         for name, a, b in (("thigh", "hip", "knee"), ("shin", "knee", "ankle"),
+                            ("foot", "heel", "big_toe"))}),
+    "cardiac": Region(
+        "chest", CHEST_JOINTS, "neck",
+        {"sternum": ("neck", "chest"),
+         "left_chest": ("left_shoulder", "left_hip"), "right_chest": ("right_shoulder", "right_hip")}),
+}
 
 
 def empty_joints() -> np.ndarray:
@@ -49,12 +82,14 @@ def empty_joints() -> np.ndarray:
 
 
 def fill_derived(joints: np.ndarray) -> None:
-    """Fill pelvis / neck from hips / shoulders when the backend doesn't provide them."""
-    for derived, (a, b) in (("pelvis", ("left_hip", "right_hip")),
-                            ("neck", ("left_shoulder", "right_shoulder"))):
+    """Fill pelvis / neck from hips / shoulders when the backend doesn't provide them, and
+    the chest centre a third of the way from the neck to the pelvis."""
+    for derived, (a, b), t in (("pelvis", ("left_hip", "right_hip"), 0.5),
+                               ("neck", ("left_shoulder", "right_shoulder"), 0.5),
+                               ("chest", ("neck", "pelvis"), 1 / 3)):
         d, ia, ib = JOINT_INDEX[derived], JOINT_INDEX[a], JOINT_INDEX[b]
         if joints[d, 3] <= 0 and joints[ia, 3] > 0 and joints[ib, 3] > 0:
-            joints[d, :3] = (joints[ia, :3] + joints[ib, :3]) / 2
+            joints[d, :3] = (1 - t) * joints[ia, :3] + t * joints[ib, :3]
             joints[d, 3] = min(joints[ia, 3], joints[ib, 3])
 
 

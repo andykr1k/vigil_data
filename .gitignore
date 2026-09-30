@@ -17,3 +17,6 @@ third_party/
 
 # Secrets (probe certificates, keys)
 secrets/
+
+# Startup timings (loading-bar estimates)
+.cache/

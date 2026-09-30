@@ -2,7 +2,6 @@
 
 Heavy work lives elsewhere so this loop keeps up with the cameras (≥30 fps):
   capture + align  → one process per camera (capture.py)
-  person detection → its own process (detect_worker.py)
   body pose        → its own thread, compiled + batched across cameras (body.py)
 
 World frame = the first camera's colour optical frame (x right, y down, z forward, metres).
@@ -22,24 +21,16 @@ import cv2
 import numpy as np
 
 from .camera import Frame
-from .config import Config
+from .config import PROJECT_ROOT, Config
 from .geometry import FloorEstimate, fit_floor, point_cloud
 from .rig import Rig, RigCalibrator, RigCamera, RigHealth, transform
-from .skeleton import BONES, JOINT_INDEX, JOINTS, LEG_JOINTS
+from .skeleton import BONES, JOINT_INDEX, JOINTS, REGIONS
 
 log = logging.getLogger(__name__)
 
 # Binary websocket messages: 8-byte header (u8 kind, u8 camera index, 2 pad, u32 seq).
 MSG_MESH, MSG_JPEG, MSG_CLOUD, MSG_ULTRASOUND = 1, 2, 3, 4
 FUSED = 255  # camera index of the fused (world-frame) cloud
-
-# Leg segments the probe tip is measured against.
-LEG_SEGMENTS = {
-    f"{side}_{name}": (f"{side}_{a}", f"{side}_{b}")
-    for side in ("left", "right")
-    for name, a, b in (("thigh", "hip", "knee"), ("shin", "knee", "ankle"),
-                       ("foot", "heel", "big_toe"))
-}
 
 Publish = Callable[[dict, list[bytes]], None]
 
@@ -66,6 +57,10 @@ class Pipeline:
         self._commands: queue.SimpleQueue[dict] = queue.SimpleQueue()
         self.clarius = None
         self.clarius_error: str | None = None
+        self.procedure: str | None = None  # chosen in the dashboard before anything loads
+        self.application: str | None = None  # its probe preset
+        self.region = REGIONS["lower_limb"]  # its body target (leg or chest)
+        self._chosen = threading.Event()
         self._us_seq = -1
         # Display depth window (m) set from the dashboard; clouds, and optionally feeds,
         # only show pixels whose depth — from their own camera — falls inside it.
@@ -85,64 +80,115 @@ class Pipeline:
 
     def command(self, msg: dict) -> None:
         """Thread-safe: dashboard commands are applied at the top of the next iteration."""
+        if msg.get("cmd") == "start":
+            if not self._chosen.is_set() and msg.get("procedure") in self.cfg.clarius.procedures:
+                self.procedure = msg["procedure"]
+                self._chosen.set()
+            return
         self._commands.put(msg)
 
     # ------------------------------------------------------------------ setup
-    def _set_status(self, state: str, message: str) -> None:
+    def _set_status(self, state: str, message: str, **extra) -> None:
         log.info("[%s] %s", state, message)
-        self.status = {"type": "status", "state": state, "message": message}
-        self.publish(self.status, [])
+        self._emit({"type": "status", "state": state, "message": message, **extra})
+
+    def _emit(self, status: dict) -> None:
+        self.status = status  # a dashboard that connects later gets the latest
+        self.publish(status, [])
+
+    def _choose_procedure(self) -> bool:
+        """Wait for the dashboard to pick a procedure; nothing loads before that."""
+        procs = [{"id": k, "label": k.replace("_", " ").title(), "application": v}
+                 for k, v in self.cfg.clarius.procedures.items()]
+        self._set_status("select", "Choose a procedure", procedures=procs)
+        while not self._chosen.wait(0.2):
+            if self._stop.is_set():
+                return False
+        return True
 
     def _main(self) -> None:
-        rig = detector = body = None
+        rig = detector = body = startup = None
         try:
+            if not self._choose_procedure():
+                return
             from .body import BodyWorker
             from .detect_worker import DetectorProcess
             from .estimators import build_estimator
+            from .startup import Startup
 
-            self._set_status("loading", "Starting camera processes…")
-            rig = Rig(self.cfg.cameras, self.cfg.resolve(self.cfg.cameras.extrinsics_path))
-            # The detector loads in its own process while we load/compile the pose model here.
-            detector = DetectorProcess(self.cfg, [rc.camera.buffer for rc in rig.cameras])
-            self._set_status("loading", f"Loading pose model ({self.cfg.estimator.backend})…")
-            estimator = build_estimator(self.cfg)
-            if estimator.faces is not None:
-                self.faces = estimator.faces.astype("<u4").tobytes()
-            self.clarius = None
-            if self.cfg.clarius.enabled:
+            c = self.cfg.clarius
+            self.application = c.procedures[self.procedure]
+            self.region = REGIONS[self.procedure]
+            steps = [("cameras", "Cameras connected"), ("pose", "Pose model loaded"),
+                     ("tracker", "Probe tracker ready"), ("detector", "Person detector loaded"),
+                     ("compile", "Pose model compiled")]
+            if c.enabled:
+                steps.append(("clarius", "Ultrasound probe"))
+            label = self.procedure.replace("_", " ").title()
+            startup = Startup(steps, self._emit, PROJECT_ROOT / ".cache" / "startup.json",
+                              {"procedure": label}, watch=lambda: self._watch_clarius(startup))
+            startup.publish()
+
+            if c.enabled:  # connects in the background while the models load
                 try:
                     from .clarius import from_config
 
-                    self.clarius = from_config(self.cfg)
+                    self.clarius = from_config(self.cfg, self.application)
+                    startup.set("clarius", "active", f"{c.model} · {self.application}")
                 except Exception as e:  # the cameras keep working without the ultrasound
                     log.warning("Clarius unavailable: %s", e)
                     self.clarius_error = str(e)
+                    startup.done("clarius", str(e), state="warn")
+
+            startup.begin("cameras")
+            rig = Rig(self.cfg.cameras, self.cfg.resolve(self.cfg.cameras.extrinsics_path))
+            names = ", ".join(f"{rc.camera.name} {rc.serial}" for rc in rig.cameras)
+            startup.done("cameras", names, state="warn" if rig.warnings else "done")
+            # The detector loads in its own process while we load/compile the pose model here.
+            detector = DetectorProcess(self.cfg, [rc.camera.buffer for rc in rig.cameras])
+            startup.begin("pose", self.cfg.estimator.backend)
+            estimator = build_estimator(self.cfg)
+            if estimator.faces is not None:
+                self.faces = estimator.faces.astype("<u4").tobytes()
+            startup.done("pose")
             tracker = None
+            startup.begin("tracker")
             if self.cfg.probe.enabled:
                 from .probe.tracker import ProbeTracker
 
                 tracker = ProbeTracker(self.cfg)
+            startup.done("tracker", "ArUco cube" if tracker else "disabled")
 
-            body = BodyWorker(self.cfg, rig, estimator, detector)
+            body = BodyWorker(self.cfg, rig, estimator, detector, self.region)
             body.start()
-            self._set_status("loading", "Compiling pose model and loading detector "
-                                        "(~30 s on first start)…")
+            startup.begin("detector", self.cfg.detector.model_id)
             detector.wait_ready()
+            startup.done("detector")
+            startup.begin("compile", "~30 s on first start")
             body.ready.wait()
             if body.error:
                 raise RuntimeError(f"pose model: {body.error}")
+            startup.done("compile", "")
+            if self.clarius is not None:
+                self._wait_clarius(startup)
+            startup.finish()
 
             self._send_hello(rig, estimator.name, tracker)
-            names = ", ".join(f"{rc.camera.name} {rc.serial}" for rc in rig.cameras)
-            msg = f"Streaming from {len(rig.cameras)} camera(s): {names}"
+            msg = f"{label} · streaming from {len(rig.cameras)} camera(s): {names}"
             if rig.warnings:
                 msg += " — " + "; ".join(rig.warnings)
             self._set_status("running", msg)
             self._loop(rig, body, estimator.name, tracker)
         except Exception as e:  # surface every failure in the dashboard
             log.error("pipeline failed:\n%s", traceback.format_exc())
-            self._set_status("error", _explain(e))
+            extra = {}
+            if startup is not None:
+                startup.fail(_explain(e))
+                extra = {"checks": startup.status()["checks"]}
+            self._set_status("error", _explain(e), **extra)
         finally:
+            if startup is not None:
+                startup.close()
             if getattr(self, "clarius", None) is not None:
                 self.clarius.close()
             if body is not None:
@@ -151,6 +197,25 @@ class Pipeline:
                 detector.close()
             if rig is not None:
                 rig.close()
+
+    def _watch_clarius(self, startup) -> None:
+        """Live connection state on the probe's check while the models load."""
+        if self.clarius is not None:
+            startup.set("clarius", detail=self.clarius.snapshot().state)
+
+    def _wait_clarius(self, startup, timeout: float = 30.0) -> None:
+        """Give the probe time to finish connecting; never block startup on it."""
+        startup.begin("clarius", self.clarius.snapshot().state)
+        deadline = time.monotonic() + timeout
+        while not self._stop.is_set():
+            s = self.clarius.snapshot()
+            if s.imaging:
+                startup.done("clarius", f"{self.application} · battery {s.battery}%")
+                return
+            if s.state.startswith("not on the probe") or time.monotonic() > deadline:
+                startup.done("clarius", s.error or s.state, state="warn")
+                return
+            self._stop.wait(0.25)
 
     def _send_hello(self, rig: Rig, backend: str, tracker) -> None:
         probe = None
@@ -173,12 +238,14 @@ class Pipeline:
             "backend": backend,
             "cameras": [rc.describe() for rc in rig.cameras],
             "joints": JOINTS,
-            "leg_joints": LEG_JOINTS,
+            "procedure": self.procedure,
+            "region": self.region.name,
+            "focus_joints": self.region.joints,
             "bones": BONES,
             "has_mesh": self.faces is not None,
             "probe": probe,
             "depth_limits": [self.cfg.cameras.depth_min_m, self.cfg.cameras.depth_max_m],
-            "clarius": {"model": self.cfg.clarius.model, "application": self.cfg.clarius.application}
+            "clarius": {"model": self.cfg.clarius.model, "application": self.application}
             if self.cfg.clarius.enabled else None,
         }
         self.publish(self.hello, [])
@@ -193,6 +260,7 @@ class Pipeline:
         calibrator: RigCalibrator | None = None
         body_seq_sent = -1
         fps, last_t, seq = 0.0, time.perf_counter(), 0
+        clouds = _Worker(self._cloud_message, self._stop)
 
         while not self._stop.is_set():
             calibrator = self._handle_commands(rig, tracker, calibrator, backend)
@@ -256,21 +324,21 @@ class Pipeline:
                 clarius = {"state": "unavailable", "error": self.clarius_error}
             # One fused cloud from every calibrated camera (world frame, de-duplicated);
             # uncalibrated cameras take turns sending their own until they're placed.
-            if sc.point_cloud and seq % sc.point_cloud_every_n == 0:
+            # Built on their own thread (the voxel sort takes tens of ms at full density), so
+            # the loop hands over the newest frames when it's idle and sends what's finished.
+            if sc.point_cloud and seq % sc.point_cloud_every_n == 0 and clouds.idle():
                 calibrated = [rc for rc in rig.cameras if rc.calibrated and frames[rc.index] is not None]
                 loose = [rc for rc in rig.cameras if not rc.calibrated and frames[rc.index] is not None]
                 tick = seq // sc.point_cloud_every_n
-                if loose and tick % 2:
+                if loose and (tick % 2 or not calibrated):
                     rc = loose[(tick // 2) % len(loose)]
-                    xyz, rgb = self._cloud(frames[rc.index], rc)
-                    binaries.append(_pack(MSG_CLOUD, rc.index, seq,
-                                          struct.pack("<I", len(xyz)) + _mm(xyz) + rgb.tobytes()))
+                    clouds.offer((rc.index, list(frames), [rc]))
                 elif calibrated:
-                    xyz, rgb = self._fused_cloud(frames, calibrated)
-                    binaries.append(_pack(MSG_CLOUD, FUSED, seq,
-                                          struct.pack("<I", len(xyz)) + _mm(xyz) + rgb.tobytes()))
+                    clouds.offer((FUSED, list(frames), calibrated))
+            if (cloud := clouds.take()) is not None:
+                binaries.append(_pack(MSG_CLOUD, cloud[0], seq, cloud[1]))
             if sc.floor_detection and (floor is None or seq % sc.floor_every_n == 0):
-                xyz, _ = self._cloud(frames[0], rig.world, full_range=True)
+                xyz, _ = self._cloud(frames[0], rig.world, full_range=True, stride=4)
                 floor = floor_estimate.update(fit_floor(xyz, sc.floor_max_tilt_deg))
 
             now = time.perf_counter()
@@ -331,7 +399,8 @@ class Pipeline:
             r = pf.refined
             probe["fit"] = {"rms_px": round(r.rms_px, 2), "corners": r.corners,
                             "depth_samples": r.depth_samples,
-                            "depth_rms_mm": None if np.isnan(r.depth_rms_mm) else round(r.depth_rms_mm, 1)}
+                            "depth_rms_mm": None if np.isnan(r.depth_rms_mm) else round(r.depth_rms_mm, 1),
+                            "rig_error_px": None if pf.rig_error_px is None else round(pf.rig_error_px, 1)}
         if est is None:
             return probe
         tip = tracker.tip_world(est)
@@ -340,7 +409,7 @@ class Pipeline:
             "position": _vec(est.position, 5),
             "rotation": _vec(est.rotation_matrix.reshape(-1), 5),
             "tip": _vec(tip, 5),
-            "nearest": _nearest_segment(tip, joints),
+            "nearest": _nearest_segment(tip, joints, self.region.segments),
         })
         # Where the tip lands in each camera image (for the feed overlays).
         for rc in rig.cameras:
@@ -433,11 +502,20 @@ class Pipeline:
         if "mask_feeds" in msg:
             self.mask_feeds = bool(msg["mask_feeds"])
 
-    def _cloud(self, frame: Frame, rc: RigCamera, full_range: bool = False):
+    def _cloud(self, frame: Frame, rc: RigCamera, full_range: bool = False, stride: int | None = None):
         c, sc = self.cfg.cameras, self.cfg.scene
         lo, hi = (c.depth_min_m, c.depth_max_m) if full_range else self.depth_range
         return point_cloud(frame.color, frame.depth, rc.camera.intrinsics,
-                           sc.point_cloud_stride, lo, hi)
+                           stride or sc.point_cloud_stride, lo, hi)
+
+    def _cloud_message(self, job) -> tuple[int, bytes]:
+        """(camera id, payload): one camera's own cloud, or the fused cloud (cam = FUSED)."""
+        cam, frames, cams = job
+        if cam == FUSED:
+            xyz, rgb = self._fused_cloud(frames, cams)
+        else:
+            xyz, rgb = self._cloud(frames[cam], cams[0])
+        return cam, struct.pack("<I", len(xyz)) + _mm(xyz) + rgb.tobytes()
 
     def _fused_cloud(self, frames, cams: list[RigCamera]) -> tuple[np.ndarray, np.ndarray]:
         """All calibrated cameras' clouds in the world frame, one point per voxel."""
@@ -461,6 +539,38 @@ class Pipeline:
         return buf.tobytes() if ok else b""
 
 
+class _Worker:
+    """Runs fn(job) on its own thread, one job at a time; the result is picked up with take()."""
+
+    def __init__(self, fn, stop: threading.Event):
+        self._fn, self._stop = fn, stop
+        self._job = self._out = None
+        self._wake = threading.Event()
+        threading.Thread(target=self._run, name="clouds", daemon=True).start()
+
+    def idle(self) -> bool:
+        return self._job is None
+
+    def offer(self, job) -> None:
+        self._job = job
+        self._wake.set()
+
+    def take(self):
+        out, self._out = self._out, None
+        return out
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if not self._wake.wait(0.2):
+                continue
+            self._wake.clear()
+            try:
+                self._out = self._fn(self._job)
+            except Exception:  # a bad frame must not kill the cloud thread
+                log.exception("point cloud failed")
+            self._job = None
+
+
 def voxel_dedupe(xyz: np.ndarray, rgb: np.ndarray, voxel: float) -> tuple[np.ndarray, np.ndarray]:
     """Keep one point per voxel so overlapping cameras don't double the density."""
     if len(xyz) == 0:
@@ -473,12 +583,13 @@ def voxel_dedupe(xyz: np.ndarray, rgb: np.ndarray, voxel: float) -> tuple[np.nda
     return xyz[first], rgb[first]
 
 
-def _nearest_segment(tip: np.ndarray, joints: np.ndarray | None) -> dict | None:
-    """Closest leg bone to the probe tip, as distance to the bone's axis."""
+def _nearest_segment(tip: np.ndarray, joints: np.ndarray | None,
+                     segments: dict[str, tuple[str, str]]) -> dict | None:
+    """Closest target segment (leg bone, chest line) to the probe tip, as distance to its axis."""
     if joints is None:
         return None
     best = None
-    for name, (a, b) in LEG_SEGMENTS.items():
+    for name, (a, b) in segments.items():
         pa, pb = joints[JOINT_INDEX[a]], joints[JOINT_INDEX[b]]
         if pa[3] <= 0 or pb[3] <= 0 or not (np.isfinite(pa[:3]).all() and np.isfinite(pb[:3]).all()):
             continue

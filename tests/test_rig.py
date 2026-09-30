@@ -7,6 +7,7 @@ import pytest
 from vigil.estimators.base import PoseResult
 from vigil.body import fuse_people as _fuse_people
 from vigil.pipeline import _nearest_segment
+from vigil.skeleton import REGIONS
 from vigil.probe.object_pose import ObjectPose, mean_rotation
 from vigil.probe.tracker import fuse_poses
 from vigil.rig import RigCalibrator, Rig, to_h
@@ -133,21 +134,24 @@ def _person(offset, conf=1.0):
 
 def test_people_fusion_averages_agreeing_views_and_ignores_other_person():
     a, b = _person(np.array([0.02, 0, 0])), _person(np.array([-0.02, 0, 0]))
-    fused = _fuse_people([(None, a), (None, b)], prev_pelvis=None)
+    fused = _fuse_people([(None, a), (None, b)], prev_anchor=None)
     np.testing.assert_allclose(fused.joints[JOINT_INDEX["left_knee"], :3], [0.1, 0.45, 2], atol=1e-6)
 
     stranger = _person(np.array([2.0, 0, 1.0]))
-    fused = _fuse_people([(None, a), (None, stranger)], prev_pelvis=np.array([0.0, 0, 2]))
+    fused = _fuse_people([(None, a), (None, stranger)], prev_anchor=np.array([0.0, 0, 2]))
     np.testing.assert_allclose(fused.joints[JOINT_INDEX["pelvis"], :3], [0.02, 0, 2], atol=1e-6)
+
+
+LEG = REGIONS["lower_limb"].segments
 
 
 def test_nearest_segment_reports_distance_to_bone_axis():
     joints = _person(np.zeros(3)).joints
-    near = _nearest_segment(np.array([0.1 + 0.03, 0.675, 2.0]), joints)  # beside the mid-shin
+    near = _nearest_segment(np.array([0.1 + 0.03, 0.675, 2.0]), joints, LEG)  # beside the mid-shin
     assert near["segment"] == "left_shin"
     assert near["distance_mm"] == pytest.approx(30.0, abs=0.01)
     assert near["along"] == pytest.approx(0.5, abs=1e-6)
-    assert _nearest_segment(np.zeros(3), None) is None
+    assert _nearest_segment(np.zeros(3), None, LEG) is None
 
 
 def test_keypoint_box_follows_confident_keypoints():
@@ -159,6 +163,19 @@ def test_keypoint_box_follows_confident_keypoints():
     box = _keypoint_box(kp)
     np.testing.assert_allclose(box, [90, 14, 210, 446])
     assert _keypoint_box(np.zeros((21, 3), np.float32)) is None
+
+
+def test_chest_region_derives_the_chest_and_measures_to_it():
+    from vigil.skeleton import fill_derived
+
+    j = empty_joints()
+    for name, xyz in {"left_shoulder": (0.2, 0, 2), "right_shoulder": (-0.2, 0, 2),
+                      "left_hip": (0.15, 0.6, 2), "right_hip": (-0.15, 0.6, 2)}.items():
+        j[JOINT_INDEX[name]] = (*xyz, 1.0)
+    fill_derived(j)
+    np.testing.assert_allclose(j[JOINT_INDEX["chest"], :3], [0, 0.2, 2], atol=1e-6)
+    near = _nearest_segment(np.array([0.0, 0.1, 1.95]), j, REGIONS["cardiac"].segments)
+    assert near["segment"] == "sternum" and near["distance_mm"] == pytest.approx(50.0, abs=0.01)
 
 
 def test_real_calibration_metadata_saves_and_reloads(tmp_path):

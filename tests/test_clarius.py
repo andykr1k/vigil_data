@@ -1,14 +1,20 @@
 """Clarius/Solum glue, exercised through the real SDK callbacks (no probe needed)."""
 
 import ctypes as C
-import socket
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
-from vigil.clarius import CONNECTED, IMAGING_READY, ClariusProbe, _ProcessedImageInfo, on_probe_network, scan_ports
+from vigil.clarius import (
+    CONNECTED,
+    ERROR_VERSION_MISMATCH,
+    IMAGING_READY,
+    ClariusProbe,
+    _ProcessedImageInfo,
+    on_probe_network,
+)
 
 SDK = Path(__file__).resolve().parents[1] / "third_party/solum/libsolum.so"
 pytestmark = pytest.mark.skipif(not SDK.is_file(), reason="Solum SDK not installed (vigil setup)")
@@ -35,21 +41,20 @@ def test_image_callback_delivers_jpeg_and_scale(probe):
 def test_state_follows_callbacks(probe):
     probe._on_connect(CONNECTED, 5001, b"")
     probe._on_imaging(IMAGING_READY, 1)
-    probe._on_cert(-1)
+    probe._on_cert(317)
     s = probe.snapshot()
-    assert s.connected and s.imaging and "ready" in s.state
-    assert s.error == "Probe certificate invalid"
+    assert s.connected and s.imaging and "ready" in s.state and s.cert_days == 317
+    assert probe._ev["connect"].is_set() and probe._ev["app"].is_set()
     assert "image" not in s.json()  # JSON status never carries the image bytes
 
 
-def test_not_on_probe_network_and_port_scan():
+def test_version_mismatch_releases_the_preset_wait(probe):
+    # The probe reports this while it still verifies its firmware; startup retries on it.
+    probe._ev["app"].clear()
+    probe._on_error(ERROR_VERSION_MISMATCH, b"software versions do not match")
+    assert probe._ev["app"].is_set() and probe._error_code == ERROR_VERSION_MISMATCH
+
+
+def test_on_probe_network():
     assert on_probe_network("127.0.0.1")
     assert not on_probe_network("10.254.254.1")
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    srv.listen()
-    try:
-        port = srv.getsockname()[1]
-        assert port in scan_ports("127.0.0.1", timeout=0.2, ports=range(port - 50, port + 50))
-    finally:
-        srv.close()

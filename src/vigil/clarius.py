@@ -2,7 +2,8 @@
 
 Connects over the probe's Wi-Fi (this machine joins the probe's access point), applies
 the certificate, loads a preset, streams B-mode images as JPEG, and reports battery,
-temperature and frame rate. Depth and gain can be changed live.
+temperature and frame rate. Depth and gain can be changed live. The startup sequence
+follows vigil-system's solumultrasoundnode (sensors package).
 """
 
 from __future__ import annotations
@@ -10,20 +11,24 @@ from __future__ import annotations
 import ctypes as C
 import logging
 import os
+import socket
 import threading
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 # Enum values from solum_def.h
-CONNECTED, DISCONNECTED, CONNECTION_FAILED, SW_UPDATE, OS_UPDATE = 0, 1, 2, 3, 4
+CONNECTED, DISCONNECTED, CONNECTION_FAILED, SW_UPDATE = 0, 1, 2, 3
 IMAGING_READY, CERT_EXPIRED = 1, 2
 IMAGING_STATES = ["not ready", "ready", "certificate expired", "poor Wi-Fi", "no contact",
                   "charging changed", "low bandwidth", "motion sensor", "no tee", "tee expired"]
-PARAM_DEPTH, PARAM_GAIN = 0, 1  # CusParam: ImageDepth (cm), Gain (%)
+PARAM_DEPTH, PARAM_GAIN, PARAM_AUTO_GAIN, PARAM_ECO = 0, 1, 2, 24  # CusParam
+MODE_B = 0  # CusMode.BMode
+ERROR_VERSION_MISMATCH = 4  # reported while the probe still verifies its firmware
 FORMAT_JPEG = 2  # CusImageFormat.Jpeg
+TIMEOUT = 20.0  # seconds to wait for each SDK callback during startup
+LOAD_ATTEMPTS, CONNECT_ATTEMPTS = 3, 4
 
 _Vp = C.c_void_p
 _ConnectFn = C.CFUNCTYPE(None, C.c_int, C.c_int, C.c_char_p)
@@ -72,8 +77,24 @@ class _StatusInfo(C.Structure):
                 ("charger", C.c_int)]
 
 
+class _ProbeSettings(C.Structure):
+    _fields_ = [(n, C.c_int) for n in (
+        "contactDetection autoFreeze keepAwake deepSleep stationary powerFan autoBoot "
+        "wifiOptimization htWifi keepAwakeCharging powerOn sounds wakeOnShake "
+        "bandwidthOptimization forceLogSend imageOnUndock alarmOnUndock up down handle "
+        "upHold downHold").split()]
+
+
+# Never freeze or sleep on its own (timeouts 0); holding a button powers it off.
+_SETTINGS = _ProbeSettings(powerFan=1, powerOn=1, sounds=1, wakeOnShake=1, upHold=1, downHold=1)
+
+
 class _Range(C.Structure):
     _fields_ = [("min", C.c_double), ("max", C.c_double)]
+
+
+class _Failed(RuntimeError):
+    pass
 
 
 @dataclass
@@ -82,7 +103,7 @@ class ClariusState:
     imaging: bool = False
     state: str = "disconnected"  # human-readable connection/imaging state
     battery: int | None = None  # %
-    temperature: int | None = None  # % of the probe's thermal limit
+    temperature: int | None = None  # % of the probe's thermal limit (Solum has no °C)
     charging: bool = False
     fps: float | None = None
     cert_days: int | None = None
@@ -101,41 +122,33 @@ class ClariusState:
 
 
 class ClariusProbe:
-    """Owns the Solum SDK session. SDK callbacks arrive on SDK threads; all state goes
-    through a lock and the pipeline reads a snapshot each frame."""
+    """Owns the Solum SDK session. Callbacks arrive on SDK threads and only record state
+    and signal events; the session thread makes every SDK call. The pipeline reads a
+    snapshot each frame."""
 
     def __init__(self, sdk_path: Path, store_dir: Path, ip: str, port: int, model: str,
                  application: str, cert: str | None, width: int = 640, height: int = 480):
         self.ip, self.port, self.model, self.application = ip, port, model, application
-        self.cert = cert
-        self._lib = C.CDLL(str(sdk_path))
+        self.cert, self.size = cert, (width, height)
+        store_dir.mkdir(parents=True, exist_ok=True)
+        self._store = str(store_dir).encode()
         self._lock = threading.Lock()
         self._s = ClariusState()
         self._stop = threading.Event()
-        self._keep = []  # C callbacks must outlive the SDK session
-        self._trying = port
+        self._ev = {k: threading.Event() for k in ("connect", "cert", "app", "imaging")}
+        self._result = self._error_code = None
+        self._update_required = False
 
-        lib = self._lib
+        lib = self._lib = C.CDLL(str(sdk_path))
         lib.solumDefaultInitParams.restype = _InitParams
         lib.solumGetParam.restype = C.c_double
-        p = lib.solumDefaultInitParams()
-        self._argv = (C.c_char_p * 1)(b"vigil")
-        p.args.argc, p.args.argv = 1, self._argv
-        store_dir.mkdir(parents=True, exist_ok=True)
-        self._store = str(store_dir).encode()
-        p.storeDir = self._store
-        p.connectFn = self._cb(_ConnectFn, self._on_connect)
-        p.certFn = self._cb(_CertFn, self._on_cert)
-        p.powerDownFn = self._cb(_PowerDownFn, self._on_power_down)
-        p.imagingFn = self._cb(_ImagingFn, self._on_imaging)
-        p.buttonFn = self._cb(_ButtonFn, lambda btn, clicks: None)
-        p.errorFn = self._cb(_ErrorFn, self._on_error)
-        p.newProcessedImageFn = self._cb(_ImageFn, self._on_image)
-        p.width, p.height = width, height
-        if lib.solumInit(C.byref(p)) != 0:
-            raise RuntimeError("solumInit failed")
-        lib.solumSetFormat(FORMAT_JPEG)  # frames arrive ready to forward to the dashboard
-        self._thread = threading.Thread(target=self._supervise, name="clarius", daemon=True)
+        lib.solumSetParam.argtypes = [C.c_int, C.c_double]
+        self._keep = [_ConnectFn(self._on_connect), _CertFn(self._on_cert),
+                      _PowerDownFn(self._on_power_down), _ImagingFn(self._on_imaging),
+                      _ButtonFn(lambda btn, clicks: None), _ErrorFn(self._on_error),
+                      _ImageFn(self._on_image)]  # C callbacks must outlive the SDK
+        self._init()
+        self._thread = threading.Thread(target=self._run, name="clarius", daemon=True)
         self._thread.start()
 
     # ---------------------------------------------------------------- public
@@ -146,69 +159,120 @@ class ClariusProbe:
     def set_param(self, name: str, value: float) -> None:
         param = {"depth": PARAM_DEPTH, "gain": PARAM_GAIN}[name]
         if name == "gain":
-            self._lib.solumSetParam(2, C.c_double(0))  # AutoGain off, or it overrides the user
-        self._lib.solumSetParam(param, C.c_double(float(value)))
+            self._lib.solumSetParam(PARAM_AUTO_GAIN, 0)  # or auto gain overrides the user
+        self._lib.solumSetParam(param, float(value))
 
     def set_running(self, run: bool) -> None:
         self._lib.solumRun(1 if run else 0)
 
     def close(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=3)
+        for e in self._ev.values():
+            e.set()  # release a startup wait
+        self._thread.join(timeout=10)  # the session thread releases the SDK
+
+    # ---------------------------------------------------------------- session
+    def _init(self) -> None:
+        p = self._lib.solumDefaultInitParams()
+        p.args.argc, p.args.argv = 0, None
+        p.storeDir = self._store
+        (p.connectFn, p.certFn, p.powerDownFn, p.imagingFn, p.buttonFn, p.errorFn,
+         p.newProcessedImageFn) = self._keep
+        p.width, p.height = self.size
+        if self._lib.solumInit(C.byref(p)) != 0:
+            raise RuntimeError("solumInit failed")
+        self._lib.solumSetProbeSettings(C.byref(_SETTINGS))
+
+    def _release(self) -> None:
+        if self._lib.solumIsConnected() == 1:  # disconnect blocks ~3 s even with no link
+            self._lib.solumRun(0)
+            self._lib.solumDisconnect()
+        self._lib.solumDestroy()
+
+    def _run(self) -> None:
+        """Start a session, stream until it drops, then start over with a fresh SDK."""
         try:
-            if self._lib.solumIsConnected() == 1:  # disconnect blocks ~3 s even with no link
-                self._lib.solumRun(0)
-                self._lib.solumDisconnect()
+            self._sessions()
         finally:
-            self._lib.solumDestroy()
+            self._release()
 
-    # ---------------------------------------------------------------- internals
-    def _cb(self, ftype, fn):
-        f = ftype(fn)
-        self._keep.append(f)
-        return f
-
-    def _update(self, **kv) -> None:
-        with self._lock:
-            for k, v in kv.items():
-                setattr(self._s, k, v)
-
-    def _status(self, text: str) -> None:
-        """Supervisor progress messages; never override what the SDK callbacks reported."""
-        with self._lock:
-            if not self._s.connected:
-                self._s.state = text
-
-    def _supervise(self) -> None:
-        """Reconnect while disconnected; poll status once a second while connected."""
-        last_try = 0.0
-        candidates: list[int] = []
+    def _sessions(self) -> None:
         while not self._stop.is_set():
-            connected = self._lib.solumIsConnected() == 1
-            if not connected and time.monotonic() - last_try > 3.0:
-                if not on_probe_network(self.ip):
-                    self._status(f"not on the probe's Wi-Fi ({self.ip})")
-                    self._stop.wait(3.0)
-                    continue
-                if not self.port and not candidates:
-                    # No Bluetooth to be told the control port: find the probe's open ports.
-                    self._status(f"searching {self.ip} for the probe's control port…")
-                    candidates = scan_ports(self.ip)
-                    if not candidates:
-                        self._status(f"probe not reachable at {self.ip} — join its Wi-Fi")
-                        self._stop.wait(3.0)
-                        continue
-                port = self.port or candidates.pop(0)
-                last_try = time.monotonic()
-                self._status(f"connecting to {self.ip}:{port}…")
-                self._trying = port
-                self._lib.solumConnect(C.byref(_ConnectionParams(self.ip.encode(), port, 0)))
-            if connected:
-                if not self.port:
-                    self.port = self._trying  # found it; remember for reconnects
-                    log.info("clarius control port is %d (set clarius.port to skip the scan)", self.port)
-                self._poll()
+            if not on_probe_network(self.ip):
+                self._update(state=f"not on the probe's Wi-Fi ({self.ip})")
+                self._stop.wait(3.0)
+                continue
+            try:
+                self._start()
+                while not self._stop.is_set() and self._lib.solumIsConnected() == 1:
+                    self._poll()
+                    self._stop.wait(1.0)
+            except _Failed as e:
+                if self._stop.is_set():
+                    return
+                log.warning("clarius: %s", e)
+                self._update(error=str(e))
+            if self._stop.is_set():
+                return
+            self._update(connected=False, imaging=False)
+            self._release()  # like vigil-system: retry on a freshly initialised SDK
+            self._stop.wait(30.0 if self._update_required else 2.0)
+            self._init()
+
+    def _start(self) -> None:
+        """connect → JPEG output → certificate → preset (retried while the probe
+        verifies its firmware) → imaging."""
+        self._update_required = False
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            self._update(state=f"connecting to {self.ip}:{self.port}…")
+            self._result = None
+            msg = self._call("connect", lambda: self._lib.solumConnect(
+                C.byref(_ConnectionParams(self.ip.encode(), self.port, 0))))
+            if self._result == CONNECTED:
+                break
+            if "refused" not in (msg or "").lower() or attempt == CONNECT_ATTEMPTS:
+                raise _Failed(f"connection failed: {msg or self._s.error}")
+            self._stop.wait(2.0)
+        self._lib.solumSeparateOverlays(0)
+        self._lib.solumSetFormat(FORMAT_JPEG)  # frames arrive ready for the dashboard
+
+        if not self.cert:
+            raise _Failed("No probe certificate (set CLARIUS_CERT_PATH in .env)")
+        self._update(cert_days=None)
+        self._call("cert", lambda: self._lib.solumSetCert(self.cert.encode()))
+        if not (self._s.cert_days or 0) > 0:
+            raise _Failed(f"probe rejected the certificate (days valid: {self._s.cert_days})")
+
+        for attempt in range(1, LOAD_ATTEMPTS + 1):
+            self._update(state=f"loading {self.model} / {self.application}…")
+            self._error_code = None
+            self._call("app", lambda: self._lib.solumLoadApplication(
+                self.model.encode(), self.application.encode()))
+            if self._error_code != ERROR_VERSION_MISMATCH:
+                break
+            if attempt == LOAD_ATTEMPTS:
+                raise _Failed("probe still reports a software version mismatch")
+            log.info("clarius: firmware verification pending; retrying the preset")
             self._stop.wait(1.0)
+        self._update(error=None)
+        self._ranges()
+        self._call("imaging", lambda: self._lib.solumRun(1))
+        self._lib.solumSetParam(PARAM_ECO, 0)
+        self._lib.solumSetMode(MODE_B)  # as vigil-system: never left in Color Doppler
+
+    def _call(self, event: str, fn) -> str | None:
+        """Make an SDK call and wait for the callback it triggers."""
+        ev = self._ev[event]
+        ev.clear()
+        if fn() != 0:
+            raise _Failed(f"SDK refused '{event}'")
+        if not ev.wait(TIMEOUT):
+            raise _Failed(f"timed out waiting for '{event}' ({self._s.error or 'no reply'})")
+        if self._update_required:
+            raise _Failed("probe requires a firmware update for this SDK")
+        if self._stop.is_set():
+            raise _Failed("stopped")
+        return self._s.error
 
     def _poll(self) -> None:
         st = _StatusInfo()
@@ -227,33 +291,30 @@ class ClariusProbe:
             if self._lib.solumGetRange(param, C.byref(r)) == 0:
                 self._update(**{name: (r.min, r.max)})
 
-    # SDK callbacks (SDK threads) ------------------------------------------------
+    def _update(self, **kv) -> None:
+        with self._lock:
+            for k, v in kv.items():
+                setattr(self._s, k, v)
+
+    # SDK callbacks (SDK threads): record and signal, never call back into the SDK -------
     def _on_connect(self, res: int, port: int, status: bytes) -> None:
         msg = (status or b"").decode(errors="replace")
+        self._result = res
         if res == CONNECTED:
             self._update(connected=True, state="connected", error=None)
-            if self.cert:
-                self._lib.solumSetCert(self.cert.encode())
-            else:
-                self._update(error="No probe certificate (set CLARIUS_CERT in .env)")
-            # Loading the preset triggers imagingFn(ImagingReady) when done.
-            self._lib.solumLoadApplication(self.model.encode(), self.application.encode())
-            self._update(state=f"loading {self.model} / {self.application}…")
-        elif res == SW_UPDATE:
-            self._update(connected=False, state="probe firmware update required",
-                         error="Probe firmware doesn't match this SDK; update it with the Clarius app.")
-        elif res == OS_UPDATE:
-            self._update(connected=False, state="probe OS update required")
         else:
-            self._update(connected=False, imaging=False,
-                         state="disconnected" if res == DISCONNECTED else "connection failed",
-                         error=msg or None)
+            self._update_required |= res == SW_UPDATE
+            self._update(connected=False, imaging=False, error=msg or None,
+                         state={DISCONNECTED: "disconnected", SW_UPDATE: "firmware update "
+                                "required"}.get(res, "connection failed"))
+            for e in self._ev.values():
+                e.set()  # nothing else is coming for a pending wait
+        self._ev["connect"].set()
         log.info("clarius connect %s %s", res, msg)
 
     def _on_cert(self, days: int) -> None:
         self._update(cert_days=days)
-        if days < 0:
-            self._update(error="Probe certificate invalid")
+        self._ev["cert"].set()
 
     def _on_power_down(self, reason: int, seconds: int) -> None:
         reasons = ["idle", "too hot", "low battery", "button", "docked", "software"]
@@ -263,16 +324,19 @@ class ClariusProbe:
         name = IMAGING_STATES[state] if 0 <= state < len(IMAGING_STATES) else str(state)
         self._update(imaging=bool(imaging), state=f"imaging: {name}" if imaging else name)
         if state == IMAGING_READY:
-            self._ranges()
-            if not imaging:
-                self._lib.solumRun(1)  # start streaming as soon as the preset is loaded
-        elif state == CERT_EXPIRED:
+            self._ev["app"].set()
+        if imaging:
+            self._ev["imaging"].set()
+        if state == CERT_EXPIRED:
             self._update(error="Probe certificate expired")
 
     def _on_error(self, code: int, msg: bytes) -> None:
         text = (msg or b"").decode(errors="replace")
         log.warning("clarius error %s: %s", code, text)
+        self._error_code = code
         self._update(error=text)
+        if code == ERROR_VERSION_MISMATCH:
+            self._ev["app"].set()  # the preset load won't report ready
 
     def _on_image(self, img, info_p, npos, pos) -> None:
         info = info_p.contents
@@ -285,9 +349,7 @@ class ClariusProbe:
 
 
 def on_probe_network(ip: str) -> bool:
-    """Is one of our interfaces on the probe's access-point subnet (/24)?"""
-    import socket
-
+    """Does the routing table reach the probe's subnet (i.e. are we on its Wi-Fi)?"""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         try:
             s.connect((ip, 9))  # no packet is sent; this just asks the routing table
@@ -297,29 +359,7 @@ def on_probe_network(ip: str) -> bool:
     return local.rsplit(".", 1)[0] == ip.rsplit(".", 1)[0]
 
 
-def scan_ports(ip: str, timeout: float = 0.4, concurrency: int = 1024,
-               ports: range = range(1, 65536)) -> list[int]:
-    """Open TCP ports on the probe (its control port among them), lowest first."""
-    import asyncio
-
-    async def probe(port: int, sem: asyncio.Semaphore) -> int | None:
-        async with sem:
-            try:
-                _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
-                w.close()
-                return port
-            except (OSError, asyncio.TimeoutError):
-                return None
-
-    async def run() -> list[int]:
-        sem = asyncio.Semaphore(concurrency)
-        found = await asyncio.gather(*(probe(p, sem) for p in ports))
-        return [p for p in found if p]
-
-    return asyncio.run(run())
-
-
-def from_config(cfg) -> ClariusProbe | None:
+def from_config(cfg, application: str) -> ClariusProbe | None:
     c = cfg.clarius
     if not c.enabled:
         return None
@@ -333,5 +373,5 @@ def from_config(cfg) -> ClariusProbe | None:
         if not path.is_file():
             raise RuntimeError(f"CLARIUS_CERT_PATH not found: {path}")
         cert = path.read_bytes().decode()  # exactly as issued (CRLF line endings kept)
-    return ClariusProbe(sdk, cfg.resolve(c.store_dir), c.ip, c.port, c.model, c.application, cert,
+    return ClariusProbe(sdk, cfg.resolve(c.store_dir), c.ip, c.port, c.model, application, cert,
                         c.width, c.height)

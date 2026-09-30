@@ -17,7 +17,7 @@ SAM3D_COMMIT = "b5c765a0d89d789985e186d396315e7590887b94"
 
 
 SOLUM_VERSION = "v12.2.4"
-SOLUM_ASSET = "solum-12.2.4-linux.x86_64-gcc_ubuntu_24.04.zip"
+SOLUM_ASSET = "solum-12.2.4-linux.x86_64-gcc_ubuntu_22.04.zip"  # the build vigil-system ships
 
 
 def _download_solum(dest) -> None:

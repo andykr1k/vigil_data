@@ -79,17 +79,22 @@ probe:
   joint_solve: true             # one pose solve over every tag corner in every calibrated camera
   use_depth: true               # also use measured depth at the tag corners (tightens distance)
   max_tag_error_px: 3.0         # drop tags that disagree with the others by more than this
+  max_rig_error_px: 3.0         # cameras disagreeing by more (stale rig calibration) → track from one camera
+  max_depth_error_mm: 15.0      # ignore measured depth that disagrees with the tags by more
 
 clarius:
-  # Clarius ultrasound over the Solum SDK. Join the probe's Wi-Fi with a spare adapter;
-  # the certificate goes in .env as CLARIUS_CERT. `uv run vigil setup` fetches the SDK.
+  # Clarius ultrasound over the Solum SDK, connected directly (no Clarius App): join the
+  # probe's Wi-Fi with a spare adapter; the certificate goes in .env as CLARIUS_CERT_PATH.
+  # `uv run vigil setup` fetches the SDK (the same libsolum.so vigil-system ships).
   enabled: true
   sdk_path: third_party/solum/libsolum.so
   store_dir: third_party/solum/keys
-  ip: 192.168.1.1          # probe address on its access point
-  port: null               # control port; null = scan the probe for it (logged once found)
+  ip: 192.168.1.1
+  port: 5000
   model: PALHD3
-  application: msk         # preset: msk, msk_knee, msk_hip, dvt, vascular, nerve, ...
+  procedures:              # dashboard choice at startup → probe imaging preset
+    cardiac: cardiac
+    lower_limb: dvt
   width: 640
   height: 480
 
@@ -100,9 +105,9 @@ smoothing:
 
 scene:
   point_cloud: true
-  point_cloud_stride: 4      # sample every Nth pixel of the depth image
-  point_cloud_every_n: 2     # send the cloud every N processed frames
-  fused_voxel_m: 0.01       # calibrated cameras merge into one cloud, one point per voxel
+  point_cloud_stride: 2      # sample every Nth pixel of the depth image (1 = every pixel)
+  point_cloud_every_n: 2     # at most every N frames; built off the camera loop, so it updates as fast as it can
+  fused_voxel_m: 0.005      # calibrated cameras merge into one cloud, one point per voxel
   floor_detection: true      # RANSAC ground plane from depth so the scene is level
   floor_max_tilt_deg: 75   # cameras can look steeply down
   floor_every_n: 15

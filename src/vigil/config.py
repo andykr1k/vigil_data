@@ -87,16 +87,19 @@ class ProbeConfig(_Strict):
     joint_solve: bool = True  # one solve over every corner in every calibrated camera
     use_depth: bool = True  # add measured depth at the tag corners to that solve
     max_tag_error_px: float = 3.0  # tags that don't fit the others by this much are dropped
+    max_rig_error_px: float = 3.0  # joint fit worse than this = cameras disagree → one camera
+    max_depth_error_mm: float = 15.0  # depth that disagrees with the tags more is ignored
 
 
 class ClariusConfig(_Strict):
     enabled: bool = True
     sdk_path: Path = Path("third_party/solum/libsolum.so")
     store_dir: Path = Path("third_party/solum/keys")
-    ip: str = "192.168.1.1"  # the probe's address on its own Wi-Fi access point
-    port: int | None = None  # control port; None = find it by scanning the probe
+    ip: str = "192.168.1.1"  # the probe, as seen from its own Wi-Fi
+    port: int = 5000  # direct-probe control port
     model: str = "PALHD3"
-    application: str = "msk"  # preset, e.g. msk, msk_knee, msk_hip, dvt, vascular
+    # Procedure picked in the dashboard → the probe's imaging preset (as in vigil-system)
+    procedures: dict[str, str] = {"cardiac": "cardiac", "lower_limb": "dvt"}
     width: int = 640  # output image size
     height: int = 480
 
@@ -109,9 +112,9 @@ class SmoothingConfig(_Strict):
 
 class SceneConfig(_Strict):
     point_cloud: bool = True
-    point_cloud_stride: int = 4
+    point_cloud_stride: int = 2
     point_cloud_every_n: int = 2
-    fused_voxel_m: float = 0.01
+    fused_voxel_m: float = 0.005
     floor_detection: bool = True
     floor_max_tilt_deg: float = 75.0
     floor_every_n: int = 15

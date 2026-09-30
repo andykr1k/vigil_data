@@ -1,6 +1,6 @@
 # Vigil
 
-Live leg pose and ArUco-cube probe tracking from one or more Intel RealSense cameras, rendered into a dark 3D scene in the browser at ≥30 fps.
+Live leg (lower-limb) or chest (cardiac) pose and ArUco-cube probe tracking from one or more Intel RealSense cameras, rendered into a dark 3D scene in the browser at ≥30 fps.
 
 ```
 camera process ×N ──► shared memory ──┬──► detector process (RT-DETR, transformers) ──┐
@@ -84,20 +84,21 @@ With 2+ calibrated cameras, each joint whose 2D keypoint is confident in at leas
 
 ## Configuration
 
-- `configs/default.yaml` holds all tunables: cameras and stream modes, depth filters, detector and person selection, backend options, probe geometry and filter, smoothing, point cloud and floor detection, server.
+- `configs/default.yaml` holds all tunables: cameras and stream modes, depth filters, detector and person selection, procedures (probe preset per procedure), backend options, probe geometry and filter, smoothing, point cloud and floor detection, server.
 - `configs/probe-filter.json` holds the probe filter method and noise tuning. `configs/extrinsics.yaml` is written by rig calibration.
 - `.env` holds secrets only (`HF_TOKEN`) and is git-ignored. Optionally set `VIGIL_CONFIG` there to choose a different YAML.
 
 Useful knobs:
 
 - `detector.select`: `closest` | `largest` | `confident`, with `max_distance_m`. Once a subject is picked, it stays tracked while visible.
+- `clarius.procedures`: the startup choices and the probe preset each loads (`cardiac: cardiac`, `lower_limb: dvt`). Lower Limb tracks the legs (with joint angles); Cardiac tracks the chest (shoulders, hips and a derived chest centre).
 - `estimator.sam3d_body.inference_type: full` also refines hands (slower). Swap `hf_repo_id` to `facebook/sam-3d-body-vith` for speed.
 - `smoothing.min_cutoff` / `beta`: lower min_cutoff means steadier; higher beta means less lag on fast moves.
 - `scene.floor_detection`: RANSAC ground plane from depth, which levels the scene and puts the grid on the real floor.
 
 ## Dashboard
 
-- **Top-left:** link status, stream and body FPS (amber below 30), latency, per-stage timings, subject lock. Below that, hip / knee / ankle angles (L/R) with a 10 s knee-flexion trace, then the PROBE panel: visible tag chips, tip XYZ, nearest bone and distance, filter selector, and reset.
+- **Top-left:** link status, stream and body FPS (amber below 30), latency, per-stage timings, target lock (leg or chest). Below that, hip / knee / ankle angles (L/R) with a 10 s knee-flexion trace, then the PROBE panel: visible tag chips, tip XYZ, nearest bone and distance, filter selector, and reset.
 - **Top-right:** display toggles, camera presets, the RIG panel (cameras, calibration state, CALIBRATE RIG), and one feed per camera with keypoints, tag outlines and the tip dot.
 - Drag to orbit, scroll to zoom, right-drag to pan. Toggle and panel states are remembered per browser.
 - `window.vigil` in the browser console exposes the scene, camera and latest frame for debugging.
@@ -116,11 +117,12 @@ src/vigil/
   rig.py                  multi-camera world frame, extrinsics file, rig calibration
   detector.py             transformers RT-DETR person detector
   detect_worker.py        detector in its own process (reads camera shared memory)
-  body.py                 body thread: tracking, batched pose, multi-view triangulation, smoothing
+  startup.py              startup checklist, progress and time left for the dashboard
+  body.py                 body thread: subject tracking, batched pose, triangulation, smoothing
   estimators/             sam3d_body.py, vitpose_depth.py (compiled, batched)
   probe/                  ArUco detection, cube pose, per-view cleaning + joint solve (solver.py),
                           filters (EKF/One Euro/Kalman), tracker
-  skeleton.py             canonical joints, bones, leg angles
+  skeleton.py             canonical joints, bones, leg/chest regions, leg angles
   geometry.py             depth sampling, deprojection, point cloud, floor detection
   filters.py              vectorised One Euro filter
   pipeline.py             camera-rate loop: probe, feeds, clouds, floor → websocket
@@ -128,7 +130,7 @@ src/vigil/
   web/                    index.html, style.css, app.js (three.js from CDN)
 ```
 
-Websocket protocol: JSON `hello` / `status` / `calibration` / `frame` messages from the server, and `{"cmd": ...}` from the dashboard (`probe_filter`, `probe_reset`, `calibrate_rig`, `cancel_calibration`, `depth_range`). Binary messages have an 8-byte header (`u8 kind, u8 camera, 2 pad, u32 seq`): kind 1 is mesh vertices (int16 mm), 2 is a JPEG preview, 3 is a point cloud (int16 mm xyz + rgb, in that camera's frame). Other coordinates are in the world frame: the first camera's color optical frame (x right, y down, z forward, metres).
+Websocket protocol: JSON `hello` / `status` / `calibration` / `frame` messages from the server, and `{"cmd": ...}` from the dashboard (`start` with the chosen procedure, `probe_filter`, `probe_reset`, `calibrate_rig`, `cancel_calibration`, `depth_range`). Binary messages have an 8-byte header (`u8 kind, u8 camera, 2 pad, u32 seq`): kind 1 is mesh vertices (int16 mm), 2 is a JPEG preview, 3 is a point cloud (int16 mm xyz + rgb, in that camera's frame). Other coordinates are in the world frame: the first camera's color optical frame (x right, y down, z forward, metres).
 
 ## Performance notes (RTX 3090, 848×480)
 

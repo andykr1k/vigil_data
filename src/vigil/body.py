@@ -1,5 +1,7 @@
-"""Body pose on its own thread: track the subject per camera, batch the pose model across
-cameras, fuse in the world frame, smooth. Runs as fast as the world camera delivers frames.
+"""Body pose on its own thread: track the subject per camera (person detector boxes), batch
+the pose model across cameras, fuse in the world frame, smooth. The procedure picks the
+target region (leg or chest): what is highlighted, measured and anchored across views.
+Runs as fast as the world camera delivers frames.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from .detect_worker import DetectorProcess
 from .estimators import PoseEstimator, PoseResult
 from .filters import OneEuroFilter
 from .rig import Rig, RigCamera, transform
-from .skeleton import JOINT_INDEX, JOINTS, LEG_JOINTS, fill_derived, leg_angles
+from .skeleton import JOINT_INDEX, JOINTS, LEG_JOINTS, REGIONS, Region, fill_derived, leg_angles
 
 log = logging.getLogger(__name__)
 
@@ -42,8 +44,10 @@ class BodyState:
 
 
 class BodyWorker:
-    def __init__(self, cfg: Config, rig: Rig, estimator: PoseEstimator, detector: DetectorProcess):
+    def __init__(self, cfg: Config, rig: Rig, estimator: PoseEstimator, detector: DetectorProcess,
+                 region: Region = REGIONS["lower_limb"]):
         self.cfg, self.rig, self.estimator, self.detector = cfg, rig, estimator, detector
+        self.region = region
         self.state = BodyState()
         self.ready = threading.Event()
         self.error: str | None = None
@@ -56,7 +60,7 @@ class BodyWorker:
         sm = cfg.smoothing
         self._joint_filter = OneEuroFilter(sm.min_cutoff, sm.beta)
         self._vert_filter = OneEuroFilter(sm.min_cutoff, sm.beta)
-        self._prev_pelvis: np.ndarray | None = None
+        self._prev_anchor: np.ndarray | None = None
 
     def start(self) -> None:
         self._thread.start()
@@ -182,8 +186,9 @@ class BodyWorker:
         return boxes[idx[np.argmin(dist[idx])]]
 
     def _fuse_and_smooth(self, results, timestamp: float) -> BodyState:
-        kept = agreeing_views(results, self._prev_pelvis)
-        fused = fuse_people(kept, None)
+        r = self.region
+        kept = agreeing_views(results, self._prev_anchor, r.anchor)
+        fused = fuse_people(kept, None, r.anchor, r.joints)
         n_tri = 0
         if fused is not None and self.cfg.estimator.triangulate and len(kept) >= 2:
             fused, n_tri = triangulate_joints(fused, kept, self.cfg.estimator.triangulation_min_conf,
@@ -191,7 +196,7 @@ class BodyWorker:
         if fused is None:
             self._joint_filter.reset()
             self._vert_filter.reset()
-            self._prev_pelvis = None
+            self._prev_anchor = None
             return BodyState()
         joints = fused.joints.copy()
         verts = fused.vertices
@@ -199,12 +204,14 @@ class BodyWorker:
             joints[:, :3] = self._joint_filter(joints[:, :3], timestamp)
             if verts is not None:
                 verts = self._vert_filter(verts, timestamp)
-        pelvis = joints[JOINT_INDEX["pelvis"]]
-        self._prev_pelvis = pelvis[:3].copy() if pelvis[3] > 0 else None
+        anchor = joints[JOINT_INDEX[r.anchor]]
+        self._prev_anchor = anchor[:3].copy() if anchor[3] > 0 else None
+        angles = leg_angles(joints) if r.name == "leg" else {}
         person = {
+            "region": r.name,
             "cameras": [rc.index for rc, _ in kept],
             "joints": joints_json(joints),
-            "angles": {k: (None if v is None else round(v, 1)) for k, v in leg_angles(joints).items()},
+            "angles": {k: (None if v is None else round(v, 1)) for k, v in angles.items()},
             "has_mesh": verts is not None,
             "triangulated": n_tri,
         }
@@ -261,17 +268,17 @@ def to_world(result: PoseResult, T: np.ndarray) -> PoseResult:
     return PoseResult(joints=joints, kp2d=result.kp2d, vertices=verts)
 
 
-def agreeing_views(results: list[tuple[RigCamera, PoseResult]],
-                   prev_pelvis: np.ndarray | None) -> list[tuple[RigCamera, PoseResult]]:
-    """The views that agree on where the subject is (pelvis ≤ 0.5 m apart)."""
+def agreeing_views(results: list[tuple[RigCamera, PoseResult]], prev_anchor: np.ndarray | None,
+                   anchor_joint: str = "pelvis") -> list[tuple[RigCamera, PoseResult]]:
+    """The views that agree on where the target is (anchor joint ≤ 0.5 m apart)."""
     if len(results) <= 1:
         return results
-    pel = JOINT_INDEX["pelvis"]
+    pel = JOINT_INDEX[anchor_joint]
 
     def pelvis(r: PoseResult):
         return r.joints[pel, :3] if r.joints[pel, 3] > 0 else None
 
-    anchor = prev_pelvis
+    anchor = prev_anchor
     if anchor is None:
         anchor = next((pelvis(r) for _, r in results if pelvis(r) is not None), None)
     if anchor is None:
@@ -282,10 +289,10 @@ def agreeing_views(results: list[tuple[RigCamera, PoseResult]],
         (pelvis(x[1]) if pelvis(x[1]) is not None else np.full(3, 1e3)) - anchor))]
 
 
-def fuse_people(results: list[tuple[RigCamera, PoseResult]],
-                prev_pelvis: np.ndarray | None) -> PoseResult | None:
-    """Merge one person seen by several cameras (all in the world frame)."""
-    results = agreeing_views(results, prev_pelvis)
+def fuse_people(results: list[tuple[RigCamera, PoseResult]], prev_anchor: np.ndarray | None,
+                anchor_joint: str = "pelvis", focus: list[str] = LEG_JOINTS) -> PoseResult | None:
+    """Merge one body seen by several cameras (all in the world frame)."""
+    results = agreeing_views(results, prev_anchor, anchor_joint)
     if not results:
         return None
     if len(results) == 1:
@@ -297,9 +304,9 @@ def fuse_people(results: list[tuple[RigCamera, PoseResult]],
     xyz = (np.nan_to_num(stack[..., :3]) * conf[..., None]).sum(0) / np.maximum(wsum, 1e-6)[:, None]
     joints = np.concatenate([xyz, conf.max(0)[:, None]], axis=1).astype(np.float32)
     joints[wsum <= 0, :3] = np.nan
-    # Mesh from the camera with the most confident legs.
-    legs = [JOINT_INDEX[j] for j in LEG_JOINTS]
-    best = max(results, key=lambda x: float(x[1].joints[legs, 3].sum()))[1]
+    # Mesh from the camera that sees the target most confidently.
+    idx = [JOINT_INDEX[j] for j in focus]
+    best = max(results, key=lambda x: float(x[1].joints[idx, 3].sum()))[1]
     return PoseResult(joints=joints, kp2d=best.kp2d, vertices=best.vertices)
 
 

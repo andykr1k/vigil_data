@@ -22,7 +22,29 @@
   <div id="stage"></div>
   <div class="vignette"></div>
 
-  <!-- ───────────── top-left: identity, telemetry, angles ───────────── -->
+  <!-- ───────────── startup: pick a procedure, then watch it load ───────────── -->
+  <div id="boot" hidden>
+    <div class="boot-card">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M16 2 L29 9.5 V22.5 L16 30 L3 22.5 V9.5 Z" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M16 8 L22 11.5 V18.5 L16 22 L10 18.5 V11.5 Z" fill="currentColor" opacity=".35"/>
+          <circle cx="16" cy="15" r="2.2" fill="currentColor"/>
+        </svg>
+        <h1>VIGIL</h1>
+      </div>
+      <p class="boot-sub" id="boot-sub">SELECT PROCEDURE</p>
+      <div class="boot-choices" id="boot-choices"></div>
+      <div id="boot-progress" hidden>
+        <div class="boot-bar"><i id="boot-bar"></i></div>
+        <div class="boot-meta"><span id="boot-pct">0%</span><span id="boot-eta"></span></div>
+        <ul class="boot-checks" id="boot-checks"></ul>
+        <p class="boot-err" id="boot-err" hidden></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ───────────── top-left: status, angles, probe ───────────── -->
   <aside class="hud hud-left">
     <section class="panel" id="panel-status">
       <div class="brand">
@@ -48,7 +70,6 @@
         <div><dt>LATENCY</dt><dd id="stat-latency">—</dd></div>
         <div><dt>POSE</dt><dd id="stat-pose">—</dd></div>
         <div><dt>PROBE</dt><dd id="stat-probe">—</dd></div>
-        <div><dt>CAMERAS</dt><dd id="stat-cams">—</dd></div>
         <div><dt>IN VIEW</dt><dd id="stat-people">—</dd></div>
         <div><dt>DET AGE</dt><dd id="stat-detect">—</dd></div>
       </dl>
@@ -78,14 +99,21 @@
       <header><span>PROBE</span><span class="unit" id="probe-state">OFFLINE</span><button class="chev" aria-label="Collapse"></button></header>
       <div class="body">
         <div class="clarius" id="clarius" hidden>
+          <h3 class="sub">CLARIUS ULTRASOUND</h3>
           <div class="cl-head"><span class="dot" id="cl-dot"></span><b id="cl-model">CLARIUS</b><span id="cl-state">—</span></div>
           <div class="cl-stats">
             <div><dt>BATTERY</dt><dd id="cl-batt">—</dd><i class="meter"><b id="cl-batt-bar"></b></i></div>
-            <div><dt>TEMP</dt><dd id="cl-temp">—</dd><i class="meter"><b id="cl-temp-bar"></b></i></div>
+            <div title="Probe temperature as a percentage of its thermal limit: the Solum SDK reports no °C value"><dt>TEMP / LIMIT</dt><dd id="cl-temp">—</dd><i class="meter"><b id="cl-temp-bar"></b></i></div>
             <div><dt>US FPS</dt><dd id="cl-fps">—</dd></div>
+          </div>
+          <div class="us-ctl">
+            <label>DEPTH <input type="range" id="us-depth" min="1" max="30" step="0.5"><b><span id="us-depth-v">—</span> cm</b></label>
+            <label>GAIN <input type="range" id="us-gain" min="0" max="100" step="1"><b><span id="us-gain-v">—</span> %</b></label>
+            <button id="us-run">FREEZE</button>
           </div>
           <p class="rig-msg err" id="cl-err"></p>
         </div>
+        <h3 class="sub">ARUCO TRACKING</h3>
         <div class="tag-chips" id="tag-chips">
           <span data-tag="0">0</span><span data-tag="1">1</span><span data-tag="2">2</span><span data-tag="3">3</span><span data-tag="4">4</span>
           <em id="probe-cams"></em>
@@ -112,7 +140,7 @@
     </section>
   </aside>
 
-  <!-- ───────────── top-right: display toggles, sensor feed ───────────── -->
+  <!-- ───────────── top-right: display, cameras, sensor feeds ───────────── -->
   <aside class="hud hud-right">
     <section class="panel collapsible" id="panel-display">
       <header><span>DISPLAY</span><button class="chev" aria-label="Collapse"></button></header>
@@ -138,9 +166,14 @@
       </div>
     </section>
 
-    <section class="panel collapsible" id="panel-depth">
-      <header><span>DEPTH WINDOW</span><span class="unit" id="depth-readout"></span><button class="chev" aria-label="Collapse"></button></header>
+    <section class="panel collapsible" id="panel-cams">
+      <header><span>CAMERAS</span><span class="unit" id="rig-meta"></span><button class="chev" aria-label="Collapse"></button></header>
       <div class="body">
+        <ul class="rig-list" id="rig-list"></ul>
+        <div class="btn-row one"><button id="rig-calibrate">CALIBRATE RIG</button></div>
+        <div class="cal-progress" id="cal-progress" hidden><i></i></div>
+        <p class="rig-msg" id="rig-msg"></p>
+        <h3 class="sub">DEPTH WINDOW <span id="depth-readout"></span></h3>
         <div class="range2">
           <div class="track"><i id="depth-fill"></i></div>
           <input type="range" id="depth-min" min="0.2" max="6" step="0.01" value="0.2" aria-label="Minimum depth">
@@ -157,31 +190,15 @@
       </div>
     </section>
 
-    <section class="panel collapsible" id="panel-rig">
-      <header><span>RIG</span><span class="unit" id="rig-meta"></span><button class="chev" aria-label="Collapse"></button></header>
-      <div class="body">
-        <ul class="rig-list" id="rig-list"></ul>
-        <div class="btn-row one"><button id="rig-calibrate">CALIBRATE RIG</button></div>
-        <div class="cal-progress" id="cal-progress" hidden><i></i></div>
-        <p class="rig-msg" id="rig-msg"></p>
-      </div>
-    </section>
-
-    <section class="panel collapsible" id="panel-us" hidden>
-      <header><span>ULTRASOUND</span><span class="unit" id="us-meta"></span><button class="chev" aria-label="Collapse"></button></header>
-      <div class="body">
-        <canvas id="us-canvas"></canvas>
-        <div class="us-ctl">
-          <label>DEPTH <input type="range" id="us-depth" min="1" max="30" step="0.5"><b><span id="us-depth-v">—</span> cm</b></label>
-          <label>GAIN <input type="range" id="us-gain" min="0" max="100" step="1"><b><span id="us-gain-v">—</span> %</b></label>
-          <button id="us-run">FREEZE</button>
-        </div>
-      </div>
-    </section>
-
     <section class="panel collapsible" id="panel-feed">
       <header><span>SENSOR FEEDS</span><button class="chev" aria-label="Collapse"></button></header>
-      <div class="body feeds" id="feeds"></div>
+      <div class="body feeds">
+        <div class="us-feed" id="panel-us" hidden>
+          <div class="feed-head"><span><b>ULTRASOUND</b></span><span id="us-meta"></span></div>
+          <canvas id="us-canvas"></canvas>
+        </div>
+        <div class="feeds" id="feeds"></div>
+      </div>
     </section>
   </aside>
 

@@ -78,3 +78,30 @@ def test_rendered_two_camera_tracking():
     assert dt < 3 and da < 1.5
     tip_true = T_world_obj[:3, :3] @ tracker.geometry.tip_array + T_world_obj[:3, 3]
     assert np.linalg.norm(tracker.tip_world(frame.measured) - tip_true) * 1000 < 6
+
+
+def test_stale_rig_calibration_tracks_from_one_camera():
+    """Cameras that disagree (camera 2 moved since calibration) must not be averaged: the
+    compromise shifts with every change of visible tags. One camera is used and flagged."""
+    tracker = ProbeTracker(Config())
+    tracker.set_method("raw")
+    T_world_obj = to_h(rot([0.4, 0.5, 0.1]), np.array([0.05, 0.0, 0.7]))
+    T_w_c2 = to_h(rot([0.05, -0.8, 0.02]), np.array([0.6, 0.02, 0.3]))
+    img1 = cv2.cvtColor(render(tracker, T_world_obj), cv2.COLOR_GRAY2RGB)
+    img2 = cv2.cvtColor(render(tracker, np.linalg.inv(T_w_c2) @ T_world_obj), cv2.COLOR_GRAY2RGB)
+    stale = to_h(rot([0.05, -0.8 + np.radians(2), 0.02]), np.array([0.62, 0.02, 0.3]))  # 2 cm, 2° off
+    inputs = [ProbeInput("cam1", np.eye(4), K, D, img1, None),
+              ProbeInput("cam2", stale, K, D, img2, None)]
+    frame = tracker.track(inputs, timestamp=1.0)
+
+    assert frame.rig_error_px is not None
+    assert frame.refined.rms_px < 1.0  # the one camera it kept fits its own tags
+    source = tracker._source
+    alone = ProbeTracker(Config())
+    alone.set_method("raw")
+    only = alone.track([i for i in inputs if i.serial == source], timestamp=1.0).measured
+    dp, da = err(frame.measured, to_h(only.rotation_matrix, only.position))
+    assert dp < 0.01 and da < 0.01  # exactly that camera's answer, not a two-camera compromise
+    # Sticky: the next frame uses the same camera.
+    tracker.track(inputs, timestamp=1.033)
+    assert tracker._source == source
