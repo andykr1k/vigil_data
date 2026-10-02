@@ -75,7 +75,7 @@ def create_app(cfg: Config) -> FastAPI:
 
     app = FastAPI(title="Vigil", lifespan=lifespan)
     app.state.pipeline = pipeline
-
+   
     @app.get("/api/mesh/faces")
     def mesh_faces() -> Response:
         if pipeline.faces is None:

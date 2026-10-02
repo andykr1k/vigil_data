@@ -133,8 +133,12 @@ class ServerConfig(_Strict):
     preview_width: int = 424
     preview_jpeg_quality: int = 70
 
+class TestConfig(_Strict):
+    mode: int = 0
+
 
 class Config(_Strict):
+    print("s")
     cameras: CamerasConfig = CamerasConfig()
     detector: DetectorConfig = DetectorConfig()
     estimator: EstimatorConfig = EstimatorConfig()
@@ -144,6 +148,8 @@ class Config(_Strict):
     scene: SceneConfig = SceneConfig()
     recording: RecordingConfig = RecordingConfig()
     server: ServerConfig = ServerConfig()
+    testing: TestConfig = TestConfig()
+    print(testing)
 
     def resolve(self, path: Path) -> Path:
         return path if path.is_absolute() else PROJECT_ROOT / path
@@ -164,4 +170,5 @@ def load_config(path: str | Path | None = None) -> Config:
         path = PROJECT_ROOT / path
     with open(path) as f:
         data = yaml.safe_load(f) or {}
+    print("still")
     return Config.model_validate(data)

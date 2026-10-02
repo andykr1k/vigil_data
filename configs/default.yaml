@@ -125,3 +125,6 @@ server:
   port: 8000
   preview_width: 424
   preview_jpeg_quality: 70
+
+testing:
+  mode: 1

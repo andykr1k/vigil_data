@@ -112,24 +112,35 @@ class Pipeline:
     def _main(self) -> None:
         rig = detector = body = startup = None
         try:
+            
             if not self._choose_procedure():
                 return
+            
+            c = self.cfg.clarius
+            self.application = c.procedures[self.procedure]
+            self.region = REGIONS[self.procedure]
+            label = self.procedure.replace("_", " ").title()
+
+            if self.cfg.testing.mode == 1:
+                self._set_status("running", f"{label} · replay testing mode")
+                self._testing_loop()
+                return
+            
+
             from .body import BodyWorker
             from .detect_worker import DetectorProcess
             from .estimators import build_estimator
             from .startup import Startup
 
-            c = self.cfg.clarius
-            self.application = c.procedures[self.procedure]
-            self.region = REGIONS[self.procedure]
+           
             steps = [("cameras", "Cameras connected"), ("pose", "Pose model loaded"),
-                     ("tracker", "Probe tracker ready"), ("detector", "Person detector loaded"),
-                     ("compile", "Pose model compiled")]
+                    ("tracker", "Probe tracker ready"), ("detector", "Person detector loaded"),
+                    ("compile", "Pose model compiled")]
             if c.enabled:
                 steps.append(("clarius", "Ultrasound probe"))
-            label = self.procedure.replace("_", " ").title()
+            
             startup = Startup(steps, self._emit, PROJECT_ROOT / ".cache" / "startup.json",
-                              {"procedure": label}, watch=lambda: self._watch_clarius(startup))
+                            {"procedure": label}, watch=lambda: self._watch_clarius(startup))
             startup.publish()
 
             if c.enabled:  # connects in the background while the models load
@@ -259,6 +270,30 @@ class Pipeline:
         if self.player is None:
             self.hello = hello
             self.publish(hello, [])
+
+
+    def _testing_loop(self) -> None:
+        """Keep recording discovery and replay working without live hardware."""
+        self._list_recordings()
+
+        while not self._stop.is_set():
+            try:
+                msg = self._commands.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            cmd = msg.get("cmd")
+            try:
+                if cmd == "recordings":
+                    self._list_recordings()
+                elif cmd == "replay":
+                    self._replay(str(msg.get("name", "")))
+                elif cmd == "replay_ctl" and self.player is not None:
+                    self.player.control(msg)
+                elif cmd == "replay_stop":
+                    self._replay(None)
+            except (ValueError, TypeError, KeyError, OSError) as e:
+                log.warning("bad testing-mode command %s: %s", msg, e)
 
     # ------------------------------------------------------------------ loop
     def _loop(self, rig: Rig, body, backend: str, tracker) -> None:
