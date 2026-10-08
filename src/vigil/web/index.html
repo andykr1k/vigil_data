@@ -205,6 +205,7 @@
         <div id="rec-replay-ctl" hidden>
           <div class="rp-name" id="rp-name"></div>
           <input type="range" id="rp-seek" min="0" max="0" step="1" value="0" aria-label="Replay position">
+          <div class="rp-marks" id="rp-marks" title="Saved meshes: click a mark to jump to its frame and show it"></div>
           <div class="rp-row">
             <button id="rp-play">PAUSE</button>
             <span id="rp-time">0:00 / 0:00</span>
@@ -213,8 +214,125 @@
               <option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option>
             </select>
           </div>
+          <h3 class="sub">SWITCH RECORDING</h3>
+          <div class="rec-load" id="rp-switch-row">
+            <select id="rp-switch" aria-label="Switch recording"></select>
+            <button id="rp-load" title="Stop this replay and play the selected recording">LOAD</button>
+          </div>
           <div class="btn-row one"><button id="rp-live">BACK TO LIVE</button></div>
         </div>
+      </div>
+    </section>
+
+    <section class="panel collapsible" id="panel-mesh">
+      <header><span>MESH METHODS</span><span class="unit" id="mesh-state">—</span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body">
+        <div class="seg-row mesh-methods" id="mesh-method">
+          <button data-method="tsdf" class="on">TSDF FUSION</button>
+        </div>
+        <p class="mesh-hint">Fuses every camera's depth around the current frame into a signed-distance volume
+          and extracts the surface the cameras saw: the upper side of the leg, open underneath.</p>
+
+        <h3 class="sub">FRAMES</h3>
+        <div class="mesh-ctl">
+          <label title="Fuse depth frames within ± this time of the current replay frame. 0 = this instant only.">WINDOW
+            <input type="range" data-mp="window_s" min="0" max="5" step="0.05" value="0.5"><b><span>±0.50</span> s</b></label>
+          <label title="Depth frames per camera at most (evenly spread over the window).">MAX/CAM
+            <input type="range" data-mp="max_frames" min="1" max="300" step="1" value="30"><b><span>30</span></b></label>
+        </div>
+        <div class="mesh-cams" id="mesh-cams"></div>
+
+        <h3 class="sub">LEG REGION</h3>
+        <div class="seg-row two" id="mesh-region">
+          <button data-region="pose" class="on" title="Upper half-capsule around the detected leg bones">POSE CAPSULE</button>
+          <button data-region="window" title="Everything inside the depth window">DEPTH WINDOW</button>
+        </div>
+        <div class="seg-row three" id="mesh-section" title="Which part of the leg to mesh. The knee is placed from the recorded knee detections that lie on the leg (median along the leg).">
+          <button data-section="whole">WHOLE LEG</button><button data-section="above" class="on">ABOVE KNEE</button><button data-section="below">BELOW KNEE</button>
+        </div>
+        <div class="mesh-ctl">
+          <label class="knee-only" title="Move the knee cut along the leg if it's off: + toward the hip, − toward the foot. The cut shows as a gold ring.">KNEE SHIFT
+            <input type="range" data-mp="knee_shift_cm" min="-20" max="20" step="0.5" value="0"><b><span>0.0</span> cm</b></label>
+        </div>
+        <div class="seg-row three" id="mesh-leg">
+          <button data-leg="left">LEFT</button><button data-leg="both" class="on">BOTH</button><button data-leg="right">RIGHT</button>
+        </div>
+        <div class="mesh-ctl">
+          <label class="pose-only" title="Keep points within this distance of a leg bone.">RADIUS
+            <input type="range" data-mp="radius_cm" min="3" max="30" step="0.5" value="11"><b><span>11.0</span> cm</b></label>
+          <label class="pose-only" title="Keep points at most this far below the bone line (joints sit on the top surface). Lower = thinner strip of the top.">BELOW
+            <input type="range" data-mp="below_cm" min="0" max="20" step="0.5" value="5"><b><span>5.0</span> cm</b></label>
+          <label title="Depth window: nearest distance from each camera.">NEAR
+            <input type="range" data-mp="depth_min" min="0.1" max="3" step="0.01" value="0.2"><b><span>0.20</span> m</b></label>
+          <label title="Depth window: farthest distance from each camera.">FAR
+            <input type="range" data-mp="depth_max" min="0.2" max="6" step="0.01" value="0.85"><b><span>0.85</span> m</b></label>
+        </div>
+        <div class="toggles mesh-toggles">
+          <label class="toggle" title="Find the flat surface the leg rests on (stool, bed) and cut it and everything under it away"><span>Cut support</span><input type="checkbox" data-mp="support" checked><i></i></label>
+          <label class="toggle" title="Drop depth pixels at discontinuities (flying pixels between leg and background)"><span>Edge filter</span><input type="checkbox" data-mp="edge_filter" checked><i></i></label>
+        </div>
+        <div class="mesh-ctl">
+          <label title="Also cut this far above the support surface">MARGIN
+            <input type="range" data-mp="support_margin_cm" min="0" max="6" step="0.25" value="1.5"><b><span>1.50</span> cm</b></label>
+        </div>
+
+        <h3 class="sub">VOLUME</h3>
+        <div class="mesh-ctl">
+          <label title="Voxel edge length: smaller = finer and slower.">VOXEL
+            <input type="range" data-mp="voxel_mm" min="1.5" max="10" step="0.5" value="3"><b><span>3.0</span> mm</b></label>
+          <label title="TSDF truncation distance: larger averages more noise but rounds off detail.">TRUNC
+            <input type="range" data-mp="trunc_mm" min="4" max="40" step="1" value="12"><b><span>12</span> mm</b></label>
+          <label title="Largest hole to fill, as a diameter (perimeter / π). Bigger gaps stay open.">MAX HOLE
+            <input type="range" data-mp="max_hole_cm" min="0.5" max="15" step="0.5" value="5"><b><span>5.0</span> cm</b></label>
+          <label title="Taubin smoothing iterations on the extracted mesh (keeps volume).">SMOOTH
+            <input type="range" data-mp="smooth" min="0" max="100" step="1" value="4"><b><span>4</span></b></label>
+        </div>
+        <div class="toggles mesh-toggles">
+          <label class="toggle" title="Feather each depth frame toward the edge of its leg mask and at grazing angles, so the hand-over between cameras is gradual (removes the seam/crack where one camera's view ends)"><span>Seam blending</span><input type="checkbox" data-mp="blend" checked><i></i></label>
+          <label class="toggle" title="Close holes smaller than MAX HOLE with a patch that follows the surrounding curvature. The sheet's outer edge is never closed."><span>Fill holes</span><input type="checkbox" data-mp="fill_holes" checked><i></i></label>
+          <label class="toggle" title="ICP: snap each depth frame onto a reference frame before fusing (fixes leg motion within the window and small camera-calibration error)"><span>Align views</span><input type="checkbox" data-mp="align" checked><i></i></label>
+          <label class="toggle" title="Keep only the largest connected piece"><span>Largest only</span><input type="checkbox" data-mp="largest" checked><i></i></label>
+        </div>
+
+        <div class="btn-row two">
+          <button id="mesh-build" disabled title="Replay a recording to build a mesh">BUILD MESH</button>
+          <button id="mesh-defaults">DEFAULTS</button>
+        </div>
+        <div class="cal-progress" id="mesh-progress" hidden><i></i></div>
+        <p class="rig-msg" id="mesh-msg"></p>
+
+        <div id="mesh-result" hidden>
+          <dl class="mesh-stats" id="mesh-stats"></dl>
+          <div class="toggles mesh-toggles">
+            <label class="toggle"><span>Show mesh</span><input type="checkbox" id="mesh-show" checked><i></i></label>
+            <label class="toggle"><span>Hide cloud</span><input type="checkbox" id="mesh-hide-cloud"><i></i></label>
+            <label class="toggle" title="Show the gold ring marking where the leg was cut at the knee"><span>Knee cut</span><input type="checkbox" id="mesh-knee-ring" checked><i></i></label>
+          </div>
+          <div class="seg-row three" id="mesh-shade">
+            <button data-shade="rgb" class="on">RGB</button><button data-shade="normal">NORMALS</button><button data-shade="holo">HOLO</button>
+          </div>
+          <div class="mesh-ctl">
+            <label>OPACITY <input type="range" id="mesh-opacity" min="0.1" max="1" step="0.05" value="1"><b><span>1.00</span></b></label>
+          </div>
+          <div class="btn-row four">
+            <button id="mesh-focus" title="Zoom the view to the mesh">FOCUS</button>
+            <button id="mesh-ply" title="Download as PLY (binary, normals + colours, world frame, metres)">PLY</button>
+            <button id="mesh-obj" title="Download as OBJ (vertex colours, world frame, metres)">OBJ</button>
+            <button id="mesh-clear" title="Remove from the view (the saved file stays in Meshes/)">HIDE</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel collapsible" id="panel-saved">
+      <header><span>SAVED MESHES</span><span class="unit" id="saved-count" title="meshes for this recording / all recordings">—</span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body">
+        <div class="seg-row two" id="saved-scope">
+          <button data-scope="this" class="on">THIS RECORDING</button>
+          <button data-scope="all">ALL RECORDINGS</button>
+        </div>
+        <p class="saved-root" id="saved-root"></p>
+        <ul class="saved-list" id="saved-list"></ul>
       </div>
     </section>
 

@@ -80,6 +80,7 @@ class Player:
         self.index, self.playing, self.speed = 0, True, 1.0
         self._sent: dict[str, object] = {}
         self._seek: int | None = 0
+        self._announce = False  # play/speed changed: re-send the current frame so dashboards see it
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="replay", daemon=True)
@@ -98,6 +99,8 @@ class Player:
             self.speed = float(np.clip(float(msg["speed"]), 0.1, 8.0))
         if "seek" in msg:
             self._seek = int(np.clip(int(msg["seek"]), 0, len(self.lines) - 1))
+        if "play" in msg or "speed" in msg:
+            self._announce = True  # nothing else is sent while paused, so say so
         self._wake.set()
 
     def close(self) -> None:
@@ -119,9 +122,13 @@ class Player:
             if self._seek is not None:
                 self.index, self._seek = self._seek, None
                 self._sent.clear()  # show everything at the new position
+                self._announce = False  # this frame carries the play state too
                 self._emit()
                 clock = None
                 continue
+            if self._announce:
+                self._announce = False
+                self._emit()  # same frame, new play state / speed (images already sent are skipped)
             if not self.playing or self.index >= len(self.lines) - 1:
                 if self.playing:
                     self.playing = False

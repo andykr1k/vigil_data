@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import Config
+from .meshing import router as mesh_router
 from .pipeline import Pipeline
 
 log = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ def create_app(cfg: Config) -> FastAPI:
 
     app = FastAPI(title="Vigil", lifespan=lifespan)
     app.state.pipeline = pipeline
+    app.include_router(mesh_router)  # MESH METHODS: /api/surface/*
    
     @app.get("/api/mesh/faces")
     def mesh_faces() -> Response:

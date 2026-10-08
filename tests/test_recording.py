@@ -78,3 +78,34 @@ def test_replay_sends_the_recording_and_seeks(tmp_path):
     time.sleep(0.3)
     assert sent[-1][0]["seq"] == 5 and not player.playing
     player.close()
+
+
+def test_pause_and_resume_are_announced(tmp_path):
+    """The dashboard's PAUSE/PLAY button reads the play state from frames, and none are sent
+    while paused: pausing and resuming must each send the current frame with the new state."""
+    rec, _ = record(tmp_path, n=40)
+    sent = []
+    player = Player(rec.path, lambda msg, bins: sent.append((msg, bins)))
+    player.start()
+
+    def wait_for(cond, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if any(cond(m["replay"]) for m, _ in sent):
+                return True
+            time.sleep(0.01)
+        return False
+
+    assert wait_for(lambda r: r["playing"])
+    sent.clear()
+    player.control({"play": False})
+    assert wait_for(lambda r: not r["playing"])          # PAUSE → the button can show PLAY
+    paused_at = player.index
+    sent.clear()
+    player.control({"play": True})
+    assert wait_for(lambda r: r["playing"])              # PLAY → it resumes
+    assert wait_for(lambda r: r["index"] > paused_at)
+    sent.clear()
+    player.control({"speed": 2})
+    assert wait_for(lambda r: r["speed"] == 2)
+    player.close()

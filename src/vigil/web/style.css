@@ -412,3 +412,63 @@ html, body {
 #rp-seek { width: 100%; margin: 10px 0 8px; accent-color: var(--cyan); }
 .rp-row { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; margin-bottom: 8px; }
 .rp-row span { text-align: center; font-variant-numeric: tabular-nums; }
+
+/* ───────────── mesh methods ───────────── */
+.mesh-methods { grid-template-columns: 1fr; margin-top: 0; }
+.seg-row.two { grid-template-columns: 1fr 1fr; }
+.seg-row.three { grid-template-columns: repeat(3, 1fr); margin-top: 6px; }
+.mesh-hint { margin: 8px 0 0; color: var(--dim); font-size: 10px; line-height: 1.45; }
+.mesh-ctl { display: grid; gap: 7px; margin-top: 8px; }
+.mesh-ctl label { display: grid; grid-template-columns: 58px 1fr 62px; align-items: center; gap: 8px;
+  font: 500 8.5px/1 var(--display); letter-spacing: 0.14em; color: var(--dim); }
+.mesh-ctl label b { font: 600 10.5px/1 var(--mono); color: var(--text); text-align: right; letter-spacing: 0; white-space: nowrap; }
+.mesh-ctl input[type=range] { width: 100%; min-width: 0; accent-color: var(--cyan); }
+.mesh-ctl label[hidden] { display: none; }
+.mesh-toggles { margin-top: 8px; }
+.mesh-cams { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.mesh-cams button {
+  flex: 1; padding: 6px 0; cursor: pointer; font: 700 8.5px/1 var(--display); letter-spacing: 0.14em;
+  color: var(--dim); background: none; border: 1px solid rgba(34, 228, 255, 0.3);
+}
+.mesh-cams button.on { color: #02050a; background: var(--cyan); border-color: var(--cyan); }
+#mesh-build.busy { color: var(--warn); border-color: var(--warn); }
+#mesh-build:disabled { opacity: 0.4; cursor: default; }
+#mesh-result[hidden] { display: none; }
+.mesh-stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px 10px; margin: 10px 0 2px; }
+.mesh-stats dt { font: 500 7.5px/1 var(--display); letter-spacing: 0.16em; color: var(--dim); }
+.mesh-stats dd { margin: 4px 0 0; font: 600 11.5px/1 var(--mono); font-variant-numeric: tabular-nums; }
+.mesh-stats .wide { grid-column: 1 / -1; }
+.mesh-stats .wide dd { font-size: 10px; font-weight: 400; color: var(--dim); line-height: 1.4; }
+#mesh-msg.err { color: var(--err); }
+.btn-row.four { grid-template-columns: repeat(4, 1fr); }
+.mesh-toggles .toggle span { white-space: nowrap; letter-spacing: 0.04em; }
+
+/* ───────────── saved meshes ───────────── */
+.rp-marks { position: relative; height: 12px; margin: -6px 0 6px; }
+.rp-marks i {
+  position: absolute; top: 0; width: 4px; height: 12px; margin-left: -2px; cursor: pointer;
+  background: var(--gold, #ffc53d); box-shadow: 0 0 6px rgba(255, 197, 61, 0.7); border-radius: 1px;
+}
+.rp-marks i.shown { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+.rp-marks i:hover { transform: scaleY(1.3); }
+.saved-root { margin: 8px 0 0; color: var(--dim); font-size: 9.5px; word-break: break-all; }
+.saved-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px;
+  max-height: 340px; overflow-y: auto; }
+.saved-list .group { font: 500 8px/1 var(--display); letter-spacing: 0.16em; color: var(--dim); margin-top: 6px; }
+.saved-list .empty { color: var(--dim); font-size: 10.5px; }
+.saved-item {
+  display: grid; grid-template-columns: 72px 1fr auto; gap: 8px; align-items: center; padding: 5px;
+  border: 1px solid var(--panel-edge); border-radius: 3px; cursor: pointer; background: rgba(0, 0, 0, 0.25);
+}
+.saved-item:hover { border-color: var(--cyan); }
+.saved-item.shown { border-color: var(--cyan); box-shadow: 0 0 10px rgba(34, 228, 255, 0.25); }
+.saved-item img, .saved-item .noimg { width: 72px; height: 41px; object-fit: cover; border-radius: 2px; background: #000; display: block; }
+.saved-item .t b { display: block; font: 600 11px/1.2 var(--mono); }
+.saved-item .t span { display: block; font-size: 9.5px; color: var(--dim); line-height: 1.4; }
+.saved-item .acts { display: flex; flex-direction: column; gap: 3px; }
+.saved-item .acts button {
+  padding: 3px 6px; cursor: pointer; font: 700 7.5px/1 var(--display); letter-spacing: 0.12em;
+  color: var(--cyan); background: none; border: 1px solid rgba(34, 228, 255, 0.3);
+}
+.saved-item .acts button.del { color: var(--err); border-color: rgba(255, 77, 106, 0.4); }
+#rp-switch-row { margin-bottom: 8px; }

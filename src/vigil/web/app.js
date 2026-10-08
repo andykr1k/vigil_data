@@ -30,6 +30,8 @@ const store = {
   set(k, v) { try { localStorage.setItem("vigil." + k, JSON.stringify(v)); } catch { /* ignore */ } },
 };
 const opts = {};
+// MESH METHODS state (declared early: applyVisibility() reads it at startup).
+const surface = { id: null, mesh: null, stats: null, shade: "rgb", building: false, needDepth: false };
 document.querySelectorAll("[data-toggle]").forEach((el) => {
   const key = el.dataset.toggle;
   el.checked = store.get("t." + key, el.checked);
@@ -1096,6 +1098,10 @@ setView("reset");
 function applyVisibility() {
   fusedCloud.visible = opts.cloud;
   for (const rc of rigCams) rc.cloud.visible = opts.cloud && !rc.info.T_world_camera;
+  if (surface.mesh?.visible && $("mesh-hide-cloud").checked) {  // MESH METHODS: "Hide cloud"
+    fusedCloud.visible = false;
+    for (const rc of rigCams) rc.cloud.visible = false;
+  }
   floor.visible = opts.grid;
   footTrails.left.line.visible = footTrails.right.line.visible = opts.trails;
   tipTrail.line.visible = opts.tiptrail && opts.probe;
@@ -1128,6 +1134,8 @@ function connect() {
     else if (msg.type === "recordings") onRecordings(msg.items);
     else if (msg.type === "recording") $("rec-msg").textContent = msg.message;
     else if (msg.type === "frame") onFrame(msg);
+    else if (msg.type === "mesh_progress") onMeshProgress(msg);
+    else if (msg.type === "meshes_changed") loadLibrary();
   };
 }
 
@@ -1210,6 +1218,7 @@ function onRecordings(items) {
   }));
   if (items.some((r) => r.name === keep)) list.value = keep;
   $("rec-replay").disabled = !items.length;
+  fillSwitch();
 }
 
 function setReplayMode(on) {
@@ -1229,6 +1238,7 @@ function updateRecording(frame) {
     $("rp-time").textContent = `${mmss(p.time)} / ${mmss(p.duration)}`;
     $("rp-play").textContent = p.playing ? "PAUSE" : "PLAY";
     $("rp-speed").value = String(p.speed);
+    syncSwitch(p.name);
     return;
   }
   $("rec-toggle").textContent = r ? "■ STOP" : "● RECORD";
@@ -1253,6 +1263,28 @@ $("rp-seek").oninput = (e) => {
 };
 $("rp-seek").onchange = (e) => { rec.dragging = false; send({ cmd: "replay_ctl", seek: +e.target.value }); };
 
+// Switch recording while replaying: the same list as RECORDINGS, inside the replay controls.
+// The server stops the current replay and starts the chosen one (no need to go back to live).
+let switchShownFor = null; // the recording the dropdown was last pointed at
+function fillSwitch() {
+  const sel = $("rp-switch"), keep = sel.value || lastFrame?.replay?.name;
+  sel.replaceChildren(...[...$("rec-list").options].map((o) => o.cloneNode(true)));
+  if ([...sel.options].some((o) => o.value === keep)) sel.value = keep;
+  updateSwitch();
+}
+function syncSwitch(name) {
+  if (name === switchShownFor) return; // leave the user's pick alone while the same recording plays
+  switchShownFor = name;
+  if ([...$("rp-switch").options].some((o) => o.value === name)) $("rp-switch").value = name;
+  updateSwitch();
+}
+function updateSwitch() {
+  const v = $("rp-switch").value;
+  $("rp-load").disabled = !v || v === lastFrame?.replay?.name;
+}
+$("rp-switch").onchange = updateSwitch;
+$("rp-load").onclick = () => { if ($("rp-switch").value) send({ cmd: "replay", name: $("rp-switch").value }); };
+
 function onHello(msg) {
   hello = msg;
   setReplayMode(!!msg.replay);
@@ -1267,6 +1299,7 @@ function onHello(msg) {
   if (msg.clarius) $("cl-model").textContent = `CLARIUS ${msg.clarius.model} · ${msg.clarius.application.toUpperCase()}`;
   meshReady = false;
   if (msg.has_mesh) loadFaces();
+  meshOnHello(msg);
   applyVisibility();
 }
 
@@ -1299,6 +1332,7 @@ function onFrame(frame) {
   updateClarius(frame.clarius);
   updateRigHealth(frame);
   updateRecording(frame);
+  meshOnFrame(frame);
   // Keep the view centred on what matters: the subject, else the probe, else the scene.
   const focus = frame.person?.joints?.pelvis ?? (frame.probe?.tracked ? frame.probe.position : null);
   if (focus) {
@@ -1310,6 +1344,432 @@ function onFrame(frame) {
     followTarget.lerp(sensorRoot.localToWorld(cloudCentre.clone()), 0.05);
   }
 }
+
+// ───────────────────────────── mesh methods ─────────────────────────────
+// Surface meshes are built server-side at the replay's current frame (POST /api/surface/build)
+// and fetched as one binary blob: u32 V, u32 F, f32 xyz, f32 normals, u8 rgb (padded), u32 faces.
+const MESH_DEFAULTS = {
+  window_s: 0.5, max_frames: 30, radius_cm: 11, below_cm: 5, depth_min: 0.2, depth_max: 0.85,
+  support: true, edge_filter: true, support_margin_cm: 1.5, voxel_mm: 3, trunc_mm: 12, smooth: 4,
+  align: true, largest: true, region: "pose", leg: "both", section: "above", knee_shift_cm: 0,
+  blend: true, fill_holes: true, max_hole_cm: 5,
+};
+const meshInputs = [...document.querySelectorAll("#panel-mesh [data-mp]")];
+const meshCams = new Set(); // camera indices switched OFF
+
+function fmtMesh(el) {
+  const v = +el.value, dec = (el.step.split(".")[1] ?? "").length;
+  return el.dataset.mp === "window_s" ? `±${v.toFixed(2)}` : v.toFixed(Math.max(dec, el.step === "0.5" ? 1 : 0));
+}
+function meshLabel(el) {
+  const span = el.parentElement.querySelector("b span");
+  if (span) span.textContent = fmtMesh(el);
+}
+function setSeg(rowId, attr, value) {
+  document.querySelectorAll(`#${rowId} button`).forEach((b) => b.classList.toggle("on", b.dataset[attr] === value));
+}
+function meshApply(p) {
+  for (const el of meshInputs) {
+    const v = p[el.dataset.mp];
+    if (v === undefined) continue;
+    if (el.type === "checkbox") el.checked = !!v; else el.value = v;
+    meshLabel(el);
+  }
+  setSeg("mesh-region", "region", p.region);
+  setSeg("mesh-leg", "leg", p.leg);
+  setSeg("mesh-section", "section", p.section);
+  document.querySelectorAll("#panel-mesh .knee-only").forEach((l) => (l.hidden = p.section === "whole"));
+  document.querySelectorAll("#panel-mesh .pose-only").forEach((l) => (l.hidden = p.region !== "pose"));
+  $("mesh-leg").hidden = p.region !== "pose";
+}
+function meshParams() {
+  const p = {};
+  for (const el of meshInputs) p[el.dataset.mp] = el.type === "checkbox" ? el.checked : +el.value;
+  p.region = document.querySelector("#mesh-region .on")?.dataset.region ?? "pose";
+  p.leg = document.querySelector("#mesh-leg .on")?.dataset.leg ?? "both";
+  p.section = document.querySelector("#mesh-section .on")?.dataset.section ?? "above";
+  const all = (hello?.cameras ?? []).filter((c) => c.T_world_camera).map((c) => c.index);
+  p.cameras = meshCams.size ? all.filter((i) => !meshCams.has(i)) : null;
+  return p;
+}
+function meshSave() { const p = meshParams(); delete p.cameras; store.set("mesh.params", p); }
+
+meshApply({ ...MESH_DEFAULTS, ...store.get("mesh.params", {}) });
+meshInputs.forEach((el) => el.addEventListener("input", () => {
+  if (el.dataset.mp === "depth_min" && +el.value > +$q("depth_max").value - 0.05) el.value = +$q("depth_max").value - 0.05;
+  if (el.dataset.mp === "depth_max" && +el.value < +$q("depth_min").value + 0.05) el.value = +$q("depth_min").value + 0.05;
+  if (el.dataset.mp.startsWith("depth_")) surface.needDepth = false; // the user's choice now wins
+  meshLabel(el); meshSave();
+}));
+function $q(mp) { return document.querySelector(`#panel-mesh [data-mp="${mp}"]`); }
+document.querySelectorAll("#mesh-region button").forEach((b) => (b.onclick = () => {
+  meshApply({ ...meshParams(), region: b.dataset.region }); meshSave();
+}));
+document.querySelectorAll("#mesh-section button").forEach((b) => (b.onclick = () => {
+  meshApply({ ...meshParams(), section: b.dataset.section }); meshSave();
+}));
+document.querySelectorAll("#mesh-leg button").forEach((b) => (b.onclick = () => {
+  setSeg("mesh-leg", "leg", b.dataset.leg); meshSave();
+}));
+$("mesh-defaults").onclick = () => {
+  meshApply({ ...MESH_DEFAULTS, ...(lastFrame?.depth_range ? { depth_min: lastFrame.depth_range.min, depth_max: lastFrame.depth_range.max } : {}) });
+  meshCams.clear(); renderMeshCams(); meshSave();
+};
+
+function renderMeshCams() {
+  const box = $("mesh-cams");
+  box.replaceChildren(...(hello?.cameras ?? []).map((c) => {
+    const b = document.createElement("button");
+    const ok = !!c.T_world_camera;
+    b.textContent = `CAM ${c.index + 1}`;
+    b.disabled = !ok;
+    b.title = ok ? "Use this camera's depth" : "Not calibrated in this recording";
+    b.classList.toggle("on", ok && !meshCams.has(c.index));
+    b.onclick = () => {
+      if (meshCams.has(c.index)) meshCams.delete(c.index);
+      else if (box.querySelectorAll("button.on").length > 1) meshCams.add(c.index); // keep at least one
+      renderMeshCams();
+    };
+    return b;
+  }));
+}
+
+function meshOnHello(msg) {
+  clearSurface();
+  meshCams.clear();
+  renderMeshCams();
+  surface.needDepth = true; // start from the recording's own depth window
+  $("mesh-build").disabled = !msg.replay;
+  $("mesh-state").textContent = msg.replay ? "READY" : "—";
+  $("mesh-msg").textContent = msg.replay ? "Pause on a frame where the leg is in view, then BUILD MESH." : "";
+  $("mesh-msg").className = "rig-msg";
+}
+function meshOnFrame(frame) {
+  const name = frame.replay?.name ?? null;
+  if (name !== library.recording || (frame.replay && frame.replay.count !== library.count)) {
+    library.recording = name;
+    library.count = frame.replay?.count ?? 0;
+    loadLibrary();
+  }
+  if (library.pending && name === library.pending.recording) {
+    const item = library.pending;
+    library.pending = null;
+    goToSaved(item);
+  }
+  if (surface.needDepth && frame.depth_range) {
+    surface.needDepth = false;
+    meshApply({ ...meshParams(), depth_min: frame.depth_range.min, depth_max: frame.depth_range.max });
+  }
+}
+
+function onMeshProgress(msg) {
+  if (!surface.building) return;
+  const bar = $("mesh-progress");
+  const span = { segmenting: [0, 0.3], aligning: [0.3, 0.55], fusing: [0.55, 0.92], meshing: [0.92, 0.95],
+    "filling holes": [0.95, 0.97], smoothing: [0.97, 1], done: [1, 1] }[msg.stage] ?? [0, 1];
+  bar.hidden = false;
+  bar.querySelector("i").style.width = `${Math.round((span[0] + (span[1] - span[0]) * msg.progress) * 100)}%`;
+  if (msg.stage !== "done") $("mesh-msg").textContent = `${msg.stage.toUpperCase()}… ${Math.round(msg.progress * 100)}%`;
+}
+
+$("mesh-build").onclick = async () => {
+  if (surface.building || !lastFrame?.replay) return;
+  surface.building = true;
+  const btn = $("mesh-build");
+  btn.textContent = "BUILDING…"; btn.classList.add("busy"); btn.disabled = true;
+  $("mesh-state").textContent = "BUILDING";
+  $("mesh-msg").className = "rig-msg";
+  $("mesh-msg").textContent = "Starting…";
+  $("mesh-progress").hidden = false;
+  $("mesh-progress").querySelector("i").style.width = "0%";
+  if (lastFrame.replay.playing) send({ cmd: "replay_ctl", play: false }); // keep the scene on the meshed frame
+  try {
+    const r = await fetch("/api/surface/build", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ method: "tsdf", index: lastFrame.replay.index, params: meshParams() }),
+    });
+    const res = await r.json();
+    if (!r.ok) throw new Error(res.error ?? `HTTP ${r.status}`);
+    const key = { recording: res.recording, stem: res.stem };
+    const bin = await fetch(meshUrl(key, "bin"));
+    if (!bin.ok) throw new Error(`mesh download failed (HTTP ${bin.status})`);
+    showSurface(key, res.entry, await bin.arrayBuffer());
+    $("mesh-state").textContent = "MESH";
+    const w = res.stats.warnings ?? [];
+    $("mesh-msg").className = w.length ? "rig-msg" : "rig-msg ok";
+    $("mesh-msg").textContent = (w.length ? w.join(" ") + " " : `Built in ${res.stats.build_s.toFixed(1)} s. `) +
+      `Saved to Meshes/${res.recording}/${res.stem}.ply`;
+    loadLibrary();
+  } catch (e) {
+    $("mesh-state").textContent = "FAILED";
+    $("mesh-msg").className = "rig-msg err";
+    $("mesh-msg").textContent = e.message;
+  } finally {
+    surface.building = false;
+    btn.textContent = "BUILD MESH"; btn.classList.remove("busy"); btn.disabled = !hello?.replay;
+    setTimeout(() => { if (!surface.building) $("mesh-progress").hidden = true; }, 800);
+  }
+};
+
+const surfaceMats = {
+  rgb: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0, side: THREE.DoubleSide }),
+  normal: new THREE.MeshNormalMaterial({ side: THREE.DoubleSide }),
+  holo: (() => { const m = holoMat.clone(); m.uniforms.uOpacity.value = 1; return m; })(),
+};
+
+// key = { recording, stem } of the saved files; entry = its sidecar (stats + where it came from).
+function showSurface(key, entry, buf) {
+  const stats = entry.stats;
+  clearSurface();
+  const dv = new DataView(buf);
+  const nv = dv.getUint32(0, true), nf = dv.getUint32(4, true);
+  let o = 8;
+  const pos = new Float32Array(buf, o, nv * 3); o += nv * 12;
+  const nrm = new Float32Array(buf, o, nv * 3); o += nv * 12;
+  const rgb = new Uint8Array(buf, o, nv * 3); o += Math.ceil(nv * 3 / 4) * 4;
+  const idx = new Uint32Array(buf, o, nf * 3);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
+  geo.setAttribute("color", new THREE.BufferAttribute(rgb, 3, true));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.computeBoundingSphere();
+  surface.mesh = new THREE.Mesh(geo, surfaceMats[surface.shade]);
+  surface.mesh.renderOrder = 2;
+  sensorRoot.add(surface.mesh);
+  if (stats.section) {
+    // Gold ring + faint disc across the leg where it was cut at the knee.
+    const g = new THREE.Group();
+    const gold = { color: 0xffd23d, transparent: true, side: THREE.DoubleSide, depthWrite: false };
+    g.add(new THREE.Mesh(new THREE.RingGeometry(0.105, 0.115, 64), new THREE.MeshBasicMaterial({ ...gold, opacity: 0.95 })));
+    g.add(new THREE.Mesh(new THREE.CircleGeometry(0.105, 64), new THREE.MeshBasicMaterial({ ...gold, opacity: 0.1 })));
+    g.position.fromArray(stats.section.knee);
+    g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3().fromArray(stats.section.axis).normalize());
+    surface.ring = glow(g);
+    surface.ring.visible = $("mesh-show").checked && $("mesh-knee-ring").checked;
+    sensorRoot.add(surface.ring);
+  }
+  surface.id = key; surface.stats = stats; surface.entry = entry;
+  setSurfaceShade(surface.shade);
+  setSurfaceOpacity(+$("mesh-opacity").value);
+  surface.mesh.visible = $("mesh-show").checked;
+  renderSurfaceStats(stats, entry);
+  renderLibrary();
+  $("mesh-result").hidden = false;
+  applyVisibility();
+  focusSurface();
+}
+
+function focusSurface() {
+  if (!surface.mesh) return;
+  const bs = surface.mesh.geometry.boundingSphere;
+  const centre = sensorRoot.localToWorld(bs.center.clone());
+  const dir = camera.position.clone().sub(controls.target).normalize();
+  const dist = Math.max(0.4, bs.radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.1);
+  controls.target.copy(centre);
+  camera.position.copy(centre).addScaledVector(dir, dist);
+  followTarget.copy(centre);
+}
+
+function clearSurface() {
+  if (surface.ring) {
+    sensorRoot.remove(surface.ring);
+    surface.ring.traverse((o) => { o.geometry?.dispose(); o.material?.dispose(); });
+    surface.ring = null;
+  }
+  if (surface.mesh) {
+    sensorRoot.remove(surface.mesh);
+    surface.mesh.geometry.dispose();
+    surface.mesh = null;
+  }
+  surface.id = surface.stats = surface.entry = null;
+  $("mesh-result").hidden = true;
+  renderLibrary();
+  applyVisibility();
+}
+
+function setSurfaceShade(shade) {
+  surface.shade = shade;
+  setSeg("mesh-shade", "shade", shade);
+  if (!surface.mesh) return;
+  surface.mesh.material = surfaceMats[shade];
+  if (shade === "holo") glow(surface.mesh); else surface.mesh.layers.disable(BLOOM_LAYER);
+}
+function setSurfaceOpacity(a) {
+  for (const m of [surfaceMats.rgb, surfaceMats.normal]) {
+    m.opacity = a; m.transparent = a < 1; m.depthWrite = a >= 1; m.needsUpdate = true;
+  }
+  surfaceMats.holo.uniforms.uOpacity.value = a;
+  $("mesh-opacity").parentElement.querySelector("b span").textContent = a.toFixed(2);
+}
+
+function renderSurfaceStats(s, entry) {
+  const views = Object.entries(s.views).map(([c, n]) => `CAM ${+c + 1}×${n}`).join(" · ");
+  const cells = [
+    ["FRAME", `${s.frame + 1} · ${mmss(s.time_s)}`], ["TRIANGLES", s.faces.toLocaleString()],
+    ["VERTICES", s.vertices.toLocaleString()], ["AREA", `${s.area_cm2.toFixed(0)} cm²`],
+    ["VOXEL", `${s.voxel_mm} mm`], ["SUPPORT", s.support ? "REMOVED" : "NONE FOUND"],
+    ["DEPTH FRAMES", views, "wide"],
+  ];
+  if (s.align) cells.push(["ALIGNMENT", `${s.align.aligned} frames snapped · fit ${s.align.rms_before_mm} → ${s.align.rms_after_mm} mm` +
+    (s.align.failed ? ` · ${s.align.failed} kept as recorded` : ""), "wide"]);
+  if (s.section) cells.push(["SECTION", `${s.section.mode === "above" ? "ABOVE" : "BELOW"} KNEE · knee from ` +
+    `${s.section.knees_used} of ${s.section.knees_seen} detections · shift ${s.section.shift_cm >= 0 ? "+" : ""}${s.section.shift_cm} cm (gold ring)`, "wide"]);
+  if (s.holes) cells.push(["HOLES", s.holes.holes_found
+    ? `filled ${s.holes.holes_filled} of ${s.holes.holes_found}` + (s.holes.holes_filled ? ` (largest ${s.holes.largest_filled_cm} cm)` : "")
+    : "none found", "wide"]);
+  if (s.joints?.length) cells.push(["LEG JOINTS", s.joints.join(", ").replaceAll("_", " "), "wide"]);
+  if (entry?.window) cells.push(["FUSED FRAMES", `${entry.window.from_frame}–${entry.window.to_frame} · ` +
+    `${entry.window.from_s.toFixed(2)}–${entry.window.to_s.toFixed(2)} s`, "wide"]);
+  if (entry?.stem) cells.push(["SAVED AS", `Meshes/${entry.recording}/${entry.stem}.ply`, "wide"]);
+  $("mesh-stats").replaceChildren(...cells.map(([k, v, cls]) => {
+    const d = document.createElement("div");
+    if (cls) d.className = cls;
+    d.innerHTML = "<dt></dt><dd></dd>";
+    d.firstChild.textContent = k; d.lastChild.textContent = v;
+    return d;
+  }));
+}
+
+document.querySelectorAll("#mesh-shade button").forEach((b) => (b.onclick = () => setSurfaceShade(b.dataset.shade)));
+$("mesh-opacity").oninput = (e) => setSurfaceOpacity(+e.target.value);
+$("mesh-show").onchange = (e) => {
+  if (surface.mesh) surface.mesh.visible = e.target.checked;
+  if (surface.ring) surface.ring.visible = e.target.checked && $("mesh-knee-ring").checked;
+  applyVisibility();
+};
+$("mesh-hide-cloud").onchange = () => applyVisibility();
+$("mesh-knee-ring").checked = store.get("mesh.kneeRing", true);
+$("mesh-knee-ring").onchange = (e) => {
+  store.set("mesh.kneeRing", e.target.checked);
+  if (surface.ring) surface.ring.visible = e.target.checked && $("mesh-show").checked;
+};
+$("mesh-clear").onclick = () => { clearSurface(); $("mesh-state").textContent = "READY"; $("mesh-msg").textContent = "Hidden. It's still saved under SAVED MESHES."; };
+const meshUrl = (key, ext) => `/api/surface/${encodeURIComponent(key.recording)}/${encodeURIComponent(key.stem)}.${ext}`;
+function downloadSurface(ext) {
+  if (!surface.id) return;
+  const a = document.createElement("a");
+  a.href = meshUrl(surface.id, ext);
+  a.download = "";
+  document.body.append(a); a.click(); a.remove();
+}
+$("mesh-ply").onclick = () => downloadSurface("ply");
+$("mesh-focus").onclick = focusSurface;
+$("mesh-obj").onclick = () => downloadSurface("obj");
+
+// ───────────────────────────── saved meshes ─────────────────────────────
+// Every build is saved under Meshes/<recording>/ (frame + time in the file name). This panel lists
+// them; opening one replays its recording at that exact frame and shows the mesh over it. The
+// replay timeline carries a mark for every saved mesh of the open recording.
+const library = { items: [], recording: null, count: 0, scope: store.get("saved.scope", "this"), pending: null };
+
+async function loadLibrary() {
+  try {
+    const r = await fetch("/api/surface");
+    const res = await r.json();
+    library.items = res.items;
+    $("saved-root").textContent = `Folder: ${res.root}`;
+  } catch { library.items = []; }
+  renderLibrary();
+}
+
+const sameKey = (a, b) => a && b && a.recording === b.recording && a.stem === b.stem;
+
+function renderLibrary() {
+  setSeg("saved-scope", "scope", library.scope);
+  const here = library.items.filter((e) => e.recording === library.recording);
+  const items = library.scope === "this" ? here : library.items;
+  $("saved-count").textContent = `${here.length} / ${library.items.length}`;
+  const list = $("saved-list");
+  const out = [];
+  if (!items.length) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = library.scope === "this"
+      ? (library.recording ? "No meshes for this recording yet. BUILD MESH saves one here." : "Open a recording.")
+      : "No saved meshes yet.";
+    out.push(li);
+  }
+  let group = null;
+  for (const e of items) {
+    if (library.scope === "all" && e.recording !== group) {
+      group = e.recording;
+      const g = document.createElement("li");
+      g.className = "group";
+      g.textContent = e.recording;
+      out.push(g);
+    }
+    const li = document.createElement("li");
+    li.className = "saved-item" + (sameKey(surface.id, e) ? " shown" : "");
+    li.title = `Open ${e.recording} at frame ${e.frame} and show this mesh`;
+    const img = e.thumbnail ? `<img loading="lazy" alt="" src="${meshUrl(e, "jpg")}">` : `<span class="noimg"></span>`;
+    li.innerHTML = `${img}<div class="t"><b></b><span></span><span></span></div>` +
+      `<div class="acts"><button class="ply" title="Download PLY">PLY</button><button class="del" title="Delete these files">DEL</button></div>`;
+    li.querySelector(".t b").textContent = `FRAME ${e.frame} · ${mmss(e.time_s)}`;
+    const spans = li.querySelectorAll(".t span");
+    spans[0].textContent = `${(e.faces ?? 0).toLocaleString()} tris · ${Math.round(e.area_cm2 ?? 0)} cm²` +
+      (e.window ? ` · ±${e.window.seconds}s` : "");
+    spans[1].textContent = `saved ${e.created.replace("T", " ")}`;
+    li.onclick = () => openSaved(e);
+    li.querySelector(".ply").onclick = (ev) => {
+      ev.stopPropagation();
+      const a = document.createElement("a"); a.href = meshUrl(e, "ply"); a.download = "";
+      document.body.append(a); a.click(); a.remove();
+    };
+    li.querySelector(".del").onclick = async (ev) => {
+      ev.stopPropagation();
+      if (!confirm(`Delete mesh at frame ${e.frame} of ${e.recording}?\n(${e.stem}.ply/.json/.jpg)`)) return;
+      await fetch(`/api/surface/${encodeURIComponent(e.recording)}/${encodeURIComponent(e.stem)}`, { method: "DELETE" });
+      if (sameKey(surface.id, e)) clearSurface();
+      loadLibrary();
+    };
+    out.push(li);
+  }
+  list.replaceChildren(...out);
+  renderMarks(here);
+}
+
+function renderMarks(here) {
+  const box = $("rp-marks");
+  const n = library.count;
+  box.replaceChildren(...(n > 1 ? here : []).map((e) => {
+    const m = document.createElement("i");
+    // Range thumbs travel between half a thumb (≈8 px) from each end.
+    m.style.left = `calc(8px + (100% - 16px) * ${e.index / (n - 1)})`;
+    m.className = sameKey(surface.id, e) ? "shown" : "";
+    m.title = `Mesh at frame ${e.frame} (${mmss(e.time_s)}): click to jump there and show it`;
+    m.onclick = () => openSaved(e);
+    return m;
+  }));
+}
+
+function openSaved(e) {
+  if (hello?.replay && lastFrame?.replay?.name === e.recording) { goToSaved(e); return; }
+  library.pending = e; // opened once the recording's first frame arrives (meshOnFrame)
+  $("mesh-msg").className = "rig-msg";
+  $("mesh-msg").textContent = `Opening ${e.recording}…`;
+  send({ cmd: "replay", name: e.recording });
+}
+
+async function goToSaved(e) {
+  send({ cmd: "replay_ctl", play: false, seek: e.index });
+  try {
+    const [side, bin] = await Promise.all([fetch(meshUrl(e, "json")), fetch(meshUrl(e, "bin"))]);
+    if (!side.ok || !bin.ok) throw new Error("mesh files missing");
+    showSurface({ recording: e.recording, stem: e.stem }, await side.json(), await bin.arrayBuffer());
+    $("mesh-state").textContent = "SAVED";
+    $("mesh-msg").className = "rig-msg ok";
+    $("mesh-msg").textContent = `Showing the saved mesh from frame ${e.frame} (${mmss(e.time_s)}); replay paused there.`;
+  } catch (err) {
+    $("mesh-msg").className = "rig-msg err";
+    $("mesh-msg").textContent = `Could not load ${e.stem}: ${err.message}`;
+  }
+}
+
+document.querySelectorAll("#saved-scope button").forEach((b) => (b.onclick = () => {
+  library.scope = b.dataset.scope; store.set("saved.scope", library.scope); renderLibrary();
+}));
+loadLibrary();
 
 // ───────────────────────────── render loop ─────────────────────────────
 const clock = new THREE.Clock();

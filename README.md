@@ -96,6 +96,33 @@ Files share one frame number, so a frame's images, cloud, probe pose and ultraso
 
 **REPLAY** plays a recording back through the dashboard in place of live data: 3D scene, point cloud, skeleton, probe, camera feeds and ultrasound. It has play/pause, speed, and a slider for scrubbing. **BACK TO LIVE** returns to the cameras.
 
+## Mesh methods (leg surface)
+
+While **replaying** a recording, the **MESH METHODS** panel builds a mesh of the leg's upper
+surface: the side the cameras see, open underneath. Pause on a frame and press **BUILD MESH**
+(a few seconds). Code: `src/vigil/meshing/`, endpoints under `/api/surface/` (`/api/mesh/` is
+the SAM 3D Body mesh).
+
+1. **Frames:** every camera's recorded depth within ±WINDOW of the frame (at most MAX/CAM each).
+2. **Leg region:** pixels within RADIUS of the recorded leg bones and at most BELOW under them,
+   inside NEAR–FAR; the edge filter drops flying pixels. vitpose_depth joints sit
+   `limb_radius_m` behind the skin, and that's taken into account.
+3. **Align views:** ICP snaps each camera onto camera 1 (calibration error, with the slide along
+   the leg locked) and each frame onto its camera's middle frame (leg motion).
+4. **Cut support:** RANSAC finds the flat surface the leg rests on (stool, bed) and removes it.
+5. **Section:** WHOLE LEG / ABOVE KNEE (default) / BELOW KNEE. The knee is the median, along the
+   leg's axis, of the recorded knee detections lying on the leg (gold ring; KNEE SHIFT moves it).
+6. **TSDF fusion** (VOXEL, TRUNC) with **seam blending:** each frame is feathered toward its mask
+   edge and grazing angles, so camera hand-overs leave no crack.
+7. **Marching cubes** only where every voxel was observed, then fill holes up to MAX HOLE,
+   keep the largest piece, and Taubin smoothing (SMOOTH; ~8–10 is a good value).
+
+Every build is saved to `Meshes/<recording>/frame<N>_t<seconds>s_tsdf_<created>.{ply,json,jpg}`
+(next to `recordings/`), with `Meshes/index.csv` listing all of them. The JSON holds the frame,
+`seq`, the time window that was fused, every setting and the stats. **SAVED MESHES** lists them;
+clicking one replays its recording paused at that frame with the mesh shown, and gold marks
+under the replay slider jump to them. Meshes are in the world frame (metres), like `cloud/*.ply`.
+
 ## Configuration
 
 - `configs/default.yaml` holds all tunables: cameras and stream modes, depth filters, detector and person selection, procedures (probe preset per procedure), backend options, probe geometry and filter, smoothing, point cloud and floor detection, server.
@@ -133,6 +160,8 @@ src/vigil/
   detect_worker.py        detector in its own process (reads camera shared memory)
   recorder.py             session recording (PLY clouds, RGB-D, meta, per-frame JSONL)
   replay.py               replays a recording through the dashboard protocol
+  meshing/                MESH METHODS: leg-surface meshes from replays (tsdf.py, holes.py,
+                          library.py = the Meshes/ folder, routes.py = /api/surface/*)
   startup.py              startup checklist, progress and time left for the dashboard
   body.py                 body thread: subject tracking, batched pose, triangulation, smoothing
   estimators/             sam3d_body.py, vitpose_depth.py (compiled, batched)
