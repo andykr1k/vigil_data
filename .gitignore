@@ -26,3 +26,6 @@ recordings/
 
 # Saved leg-surface meshes (MESH METHODS)
 Meshes/
+
+# FLATTEN MESH native solver build
+src/vigil/meshing/native/build/

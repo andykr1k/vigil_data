@@ -62,7 +62,7 @@ estimator:
     depth_patch_px: 7           # median depth over a square patch around each keypoint
     limb_radius_m: 0.06
     max_depth_jump_m: 1.0       # reject keypoints whose depth disagrees with the body median
-    compile: true               # CUDA graphs: ~4 ms for both cameras (vs ~16 ms); ~25 s startup
+    compile: true              # CUDA graphs: ~4 ms for both cameras (vs ~16 ms); ~25 s startup
     half: true
 
 probe:
@@ -86,7 +86,7 @@ clarius:
   # Clarius ultrasound over the Solum SDK, connected directly (no Clarius App): join the
   # probe's Wi-Fi with a spare adapter; the certificate goes in .env as CLARIUS_CERT_PATH.
   # `uv run vigil setup` fetches the SDK (the same libsolum.so vigil-system ships).
-  enabled: true
+  enabled: false
   sdk_path: third_party/solum/libsolum.so
   store_dir: third_party/solum/keys
   ip: 192.168.1.1
@@ -127,4 +127,4 @@ server:
   preview_jpeg_quality: 70
 
 testing:
-  mode: 1
+  mode: 0

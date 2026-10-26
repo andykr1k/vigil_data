@@ -324,6 +324,51 @@
       </div>
     </section>
 
+    <section class="panel collapsible" id="panel-flat">
+      <header><span>FLATTEN MESH</span><span class="unit" id="flat-state">—</span><button class="chev" aria-label="Collapse"></button></header>
+      <div class="body">
+        <p class="mesh-hint">Unrolls a saved leg surface onto the plane. Click the flat sheet to mark a point:
+          the same spot is marked on the 3D surface.</p>
+        <div class="mesh-ctl">
+          <label class="flat-src" title="A saved surface mesh (BUILD MESH saves them)">MESH
+            <select id="flat-source"></select></label>
+        </div>
+        <div class="seg-row two" id="flat-method">
+          <button data-method="scaf" class="on" title="SCAF · Jiang 2017: symmetric Dirichlet energy with a scaffold that keeps the boundary from overlapping (libigl)">SCAF</button>
+          <button data-method="arap" title="ARAP · Liu 2008: as-rigid-as-possible, local/global (libigl)">ARAP</button>
+        </div>
+        <div class="mesh-ctl">
+          <label title="Solver iterations (SCAF stops early once converged)">ITERATIONS
+            <input type="range" id="flat-iters" min="1" max="200" step="1" value="50"><b><span>50</span></b></label>
+        </div>
+        <div class="btn-row one">
+          <button id="flat-run" disabled title="Pick a saved mesh first">FLATTEN</button>
+        </div>
+        <div class="cal-progress" id="flat-progress" hidden><i></i></div>
+        <p class="rig-msg" id="flat-msg"></p>
+
+        <div id="flat-result" hidden>
+          <div class="flat-view">
+            <canvas id="flat-canvas" title="Drag to pan, wheel to zoom, click to mark a point"></canvas>
+            <span class="flat-scale" id="flat-scale"></span>
+            <span class="flat-legend" id="flat-legend" hidden><i></i><span>1.0</span><span>1.25</span><span>≥1.5</span></span>
+          </div>
+          <p class="flat-pick" id="flat-pick">Click the flat sheet to mark a point.</p>
+          <div class="seg-row two" id="flat-shade">
+            <button data-shade="rgb" class="on" title="Camera colours">RGB</button>
+            <button data-shade="stretch" title="How much each triangle is stretched or squashed by the unrolling (1 = not at all)">STRETCH</button>
+          </div>
+          <dl class="mesh-stats" id="flat-stats"></dl>
+          <div class="btn-row four">
+            <button id="flat-fit" title="Fit the flat sheet to the view">FIT</button>
+            <button id="flat-unpick" title="Remove the marked point">CLEAR PT</button>
+            <button id="flat-ply" title="Download the flat sheet as PLY (x, y in metres, z = 0)">PLY</button>
+            <button id="flat-clear" title="Close the flat view (the files stay in Meshes/)">HIDE</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section class="panel collapsible" id="panel-saved">
       <header><span>SAVED MESHES</span><span class="unit" id="saved-count" title="meshes for this recording / all recordings">—</span><button class="chev" aria-label="Collapse"></button></header>
       <div class="body">

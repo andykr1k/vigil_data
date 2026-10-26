@@ -7,6 +7,9 @@
         frame00600_t0021.88s_tsdf_20261002-143012.ply   the mesh (world frame, metres)
         frame00600_t0021.88s_tsdf_20261002-143012.json  recording, frame, seq, time, window, settings, stats
         frame00600_t0021.88s_tsdf_20261002-143012.jpg   camera 1 at that frame (thumbnail)
+        frame00600_t0021.88s_flat-scaf_20261008-101500-123456.{ply,json,jpg,npz}
+                                                FLATTEN MESH: that surface unrolled (SCAF / ARAP);
+                                                the .npz maps every flat point back onto it
 
 `frame` is the frame number the viewer shows (1-based, "FRAME 600 / 1317"); `index` in the
 JSON is the same frame 0-based, `seq` the recorder's frame number (file names in recordings/).
@@ -22,10 +25,15 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import cv2
+import numpy as np
 
 from .tsdf import Mesh
+
+if TYPE_CHECKING:
+    from .flatten import FlatResult
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +56,11 @@ recording. In the viewer, SAVED MESHES opens a mesh together with its recording 
 Coordinates: the recording's world frame (camera 1 colour optical frame: x right, y down,
 z forward), metres -- the same frame as the recording's cloud/*.ply and frames.jsonl.
 
+Flattened meshes (FLATTEN MESH) sit next to the surface they came from, named
+frameNNNNN_tSSSS.SSs_flat-<scaf|arap>_<created>. Their .ply is the flat sheet (x, y in metres,
+z = 0); the .npz holds the full correspondence (uv, the 3D vertices and triangles, per-triangle
+stretch); the .json names the source mesh and holds the distortion stats.
+
 index.csv lists every mesh in one table (rebuilt on every save / delete).
 """
 
@@ -63,7 +76,7 @@ class MeshLibrary:
         return self.root / recording
 
     def path(self, recording: str, stem: str, ext: str) -> Path:
-        if not SAFE.match(stem) or ext not in ("ply", "json", "jpg"):
+        if not SAFE.match(stem) or ext not in ("ply", "json", "jpg", "npz"):
             raise ValueError("bad mesh name")
         return self._dir(recording) / f"{stem}.{ext}"
 
@@ -114,6 +127,43 @@ class MeshLibrary:
         log.info("saved mesh %s/%s", recording_path.name, stem)
         return entry
 
+    def save_flat(self, result: FlatResult, source: dict) -> dict:
+        """Save a flattened mesh next to its source (whose sidecar entry is `source`)."""
+        recording = source["recording"]
+        folder = self._dir(recording)
+        folder.mkdir(parents=True, exist_ok=True)
+        created = datetime.now()
+        stats = result.flat.stats
+        stem = (f"frame{source['frame']:05d}_t{source['time_s']:07.2f}s_"
+                f"flat-{stats['flatten_method']}_{created:%Y%m%d-%H%M%S-%f}")
+        thumb = None
+        src_jpg = self.path(recording, source["stem"], "jpg")
+        if src_jpg.is_file():
+            (folder / f"{stem}.jpg").write_bytes(src_jpg.read_bytes())
+            thumb = f"{stem}.jpg"
+        with open(folder / f"{stem}.npz", "wb") as f:
+            np.savez_compressed(f, **result.arrays)
+        (folder / f"{stem}.ply").write_bytes(result.flat.to_ply())
+        entry = {k: source.get(k) for k in ("recording", "frame", "index", "seq", "time_s", "window", "frame_files")}
+        entry.update({"stem": stem, "method": "flat", "flatten_method": stats["flatten_method"],
+                      "created": created.isoformat(timespec="seconds"),
+                      "source": {"recording": recording, "stem": source["stem"]},
+                      "files": {"mesh": f"{stem}.ply", "thumbnail": thumb, "sidecar": f"{stem}.json",
+                                "mapping": f"{stem}.npz"},
+                      "stats": stats})
+        (folder / f"{stem}.json").write_text(json.dumps(entry, indent=2))
+        self._write_index()
+        log.info("saved flat mesh %s/%s", recording, stem)
+        return entry
+
+    def load_flat(self, recording: str, stem: str) -> tuple[dict[str, np.ndarray], dict]:
+        """A flattened mesh's correspondence arrays (the .npz) and its sidecar entry."""
+        entry = json.loads(self.path(recording, stem, "json").read_text())
+        if entry.get("method") != "flat":
+            raise ValueError("not a flattened mesh")
+        with np.load(self.path(recording, stem, "npz"), allow_pickle=False) as data:
+            return {k: data[k] for k in data.files}, entry
+
     # ------------------------------------------------------------------ read
     def list(self, recording: str | None = None) -> list[dict]:
         if not self.root.is_dir():
@@ -131,10 +181,11 @@ class MeshLibrary:
                 continue
             s = e.get("stats", {})
             out.append({k: e.get(k) for k in ("recording", "stem", "frame", "index", "seq", "time_s",
-                                              "window", "method", "created")}
+                                              "window", "method", "flatten_method", "source", "created")}
                        | {"thumbnail": bool(e.get("files", {}).get("thumbnail")),
                           "faces": s.get("faces"), "area_cm2": s.get("area_cm2"),
-                          "vertices": s.get("vertices")})
+                          "vertices": s.get("vertices"),
+                          "stretch_p95": (s.get("distortion") or {}).get("stretch_p95")})
         out.sort(key=lambda e: (e["recording"], e["index"], e["created"]))
         return out
 
@@ -146,7 +197,7 @@ class MeshLibrary:
         return Mesh.from_ply(ply.read_bytes(), stats), entry
 
     def delete(self, recording: str, stem: str) -> None:
-        for ext in ("ply", "json", "jpg"):
+        for ext in ("ply", "json", "jpg", "npz"):
             self.path(recording, stem, ext).unlink(missing_ok=True)
         folder = self._dir(recording)
         if folder.is_dir() and not any(folder.iterdir()):
@@ -165,5 +216,5 @@ class MeshLibrary:
             for e in rows:
                 win = e.get("window") or {}
                 w.writerow([e["recording"], e["frame"], e["time_s"], e["seq"], win.get("from_s"),
-                            win.get("to_s"), e["method"], e["faces"], e["area_cm2"], e["created"],
+                            win.get("to_s"), e["method"] + (f"-{e['flatten_method']}" if e.get("flatten_method") else ""), e["faces"], e["area_cm2"], e["created"],
                             f"{e['recording']}/{e['stem']}.ply"])

@@ -123,6 +123,30 @@ Every build is saved to `Meshes/<recording>/frame<N>_t<seconds>s_tsdf_<created>.
 clicking one replays its recording paused at that frame with the mesh shown, and gold marks
 under the replay slider jump to them. Meshes are in the world frame (metres), like `cloud/*.ply`.
 
+## Flatten mesh (unroll a saved surface)
+
+The **FLATTEN MESH** panel unrolls a saved surface onto the plane. Pick the mesh, choose
+**SCAF** (Jiang 2017) or **ARAP** (Liu 2008), and press **FLATTEN**. No replay is needed,
+but the source surface is opened in 3D so points can be shown on it. Code:
+`src/vigil/meshing/flatten.py`; the optimisation is the authors' libigl code in
+`src/vigil/meshing/native/` (sources and licences in `SOURCES.md`). It is built with CMake on
+the first FLATTEN, which needs CMake, a C++17 compiler and Eigen3 (`apt install cmake g++ libeigen3-dev`).
+
+- **Flat view:** drag to pan, wheel to zoom. **RGB** shows the camera colours, **STRETCH** how much
+  each triangle is stretched or squashed (1 = not at all). Patched holes are drawn dimmed.
+- **Click a point** on the flat sheet: it's marked red there and at the same spot on the 3D
+  surface (same triangle, same barycentric position). The readout gives both coordinates.
+- The surface must be one sheet with no handles after closing holes up to 5 cm. Otherwise
+  it's rejected with a message, as is any result with flipped triangles or an overlapping edge.
+  Handles (small tunnels through the sheet) form when the surface is extracted, so SMOOTH and
+  MAX HOLE don't remove them; rebuilding with a larger TRUNC (e.g. 20 mm) or VOXEL (4 mm) usually does.
+  Nothing is saved and the other method is never substituted.
+
+Each result is saved next to its source: `Meshes/<recording>/frame<N>_t<seconds>s_flat-<scaf|arap>_<created>.{ply,json,jpg,npz}`.
+The `.ply` is the flat sheet (x, y in metres, z = 0), the `.npz` the full flat ↔ 3D correspondence,
+and the `.json` names the source mesh and holds the stretch statistics. It is listed in
+**SAVED MESHES** with a FLAT tag.
+
 ## Configuration
 
 - `configs/default.yaml` holds all tunables: cameras and stream modes, depth filters, detector and person selection, procedures (probe preset per procedure), backend options, probe geometry and filter, smoothing, point cloud and floor detection, server.
@@ -161,6 +185,7 @@ src/vigil/
   recorder.py             session recording (PLY clouds, RGB-D, meta, per-frame JSONL)
   replay.py               replays a recording through the dashboard protocol
   meshing/                MESH METHODS: leg-surface meshes from replays (tsdf.py, holes.py,
+                          flatten.py + native/ = FLATTEN MESH (SCAF / ARAP),
                           library.py = the Meshes/ folder, routes.py = /api/surface/*)
   startup.py              startup checklist, progress and time left for the dashboard
   body.py                 body thread: subject tracking, batched pose, triangulation, smoothing

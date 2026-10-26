@@ -1135,6 +1135,7 @@ function connect() {
     else if (msg.type === "recording") $("rec-msg").textContent = msg.message;
     else if (msg.type === "frame") onFrame(msg);
     else if (msg.type === "mesh_progress") onMeshProgress(msg);
+    else if (msg.type === "flatten_progress") onFlatProgress(msg);
     else if (msg.type === "meshes_changed") loadLibrary();
   };
 }
@@ -1700,15 +1701,23 @@ function renderLibrary() {
       out.push(g);
     }
     const li = document.createElement("li");
-    li.className = "saved-item" + (sameKey(surface.id, e) ? " shown" : "");
-    li.title = `Open ${e.recording} at frame ${e.frame} and show this mesh`;
+    const isFlat = e.method === "flat";
+    li.className = "saved-item" + (sameKey(isFlat ? flat.key : surface.id, e) ? " shown" : "");
+    li.title = isFlat ? `Show this flattened mesh, with its surface at frame ${e.frame} of ${e.recording}`
+      : `Open ${e.recording} at frame ${e.frame} and show this mesh`;
     const img = e.thumbnail ? `<img loading="lazy" alt="" src="${meshUrl(e, "jpg")}">` : `<span class="noimg"></span>`;
     li.innerHTML = `${img}<div class="t"><b></b><span></span><span></span></div>` +
       `<div class="acts"><button class="ply" title="Download PLY">PLY</button><button class="del" title="Delete these files">DEL</button></div>`;
     li.querySelector(".t b").textContent = `FRAME ${e.frame} · ${mmss(e.time_s)}`;
-    const spans = li.querySelectorAll(".t span");
+    if (isFlat) {
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = `FLAT · ${e.flatten_method.toUpperCase()}`;
+      li.querySelector(".t b").prepend(tag);
+    }
+    const spans = li.querySelectorAll(".t > span");
     spans[0].textContent = `${(e.faces ?? 0).toLocaleString()} tris · ${Math.round(e.area_cm2 ?? 0)} cm²` +
-      (e.window ? ` · ±${e.window.seconds}s` : "");
+      (isFlat ? ` · stretch p95 ${(e.stretch_p95 ?? 0).toFixed(2)}` : e.window ? ` · ±${e.window.seconds}s` : "");
     spans[1].textContent = `saved ${e.created.replace("T", " ")}`;
     li.onclick = () => openSaved(e);
     li.querySelector(".ply").onclick = (ev) => {
@@ -1721,12 +1730,15 @@ function renderLibrary() {
       if (!confirm(`Delete mesh at frame ${e.frame} of ${e.recording}?\n(${e.stem}.ply/.json/.jpg)`)) return;
       await fetch(`/api/surface/${encodeURIComponent(e.recording)}/${encodeURIComponent(e.stem)}`, { method: "DELETE" });
       if (sameKey(surface.id, e)) clearSurface();
+      if (sameKey(flat.key, e)) closeFlat();
       loadLibrary();
     };
     out.push(li);
   }
   list.replaceChildren(...out);
-  renderMarks(here);
+  renderMarks(here.filter((e) => e.method !== "flat")); // a flat mesh sits on its surface's mark
+  renderFlatSources();
+  updatePickMarker();
 }
 
 function renderMarks(here) {
@@ -1744,6 +1756,13 @@ function renderMarks(here) {
 }
 
 function openSaved(e) {
+  if (e.method === "flat") { // into FLATTEN MESH, with its source surface in 3D
+    loadFlat(e).then(() => showFlatSource(e.source)).catch((err) => {
+      $("flat-msg").className = "rig-msg err";
+      $("flat-msg").textContent = `Could not load ${e.stem}: ${err.message}`;
+    });
+    return;
+  }
   if (hello?.replay && lastFrame?.replay?.name === e.recording) { goToSaved(e); return; }
   library.pending = e; // opened once the recording's first frame arrives (meshOnFrame)
   $("mesh-msg").className = "rig-msg";
@@ -1769,6 +1788,369 @@ async function goToSaved(e) {
 document.querySelectorAll("#saved-scope button").forEach((b) => (b.onclick = () => {
   library.scope = b.dataset.scope; store.set("saved.scope", library.scope); renderLibrary();
 }));
+
+// ───────────────────────────── flatten mesh ─────────────────────────────
+// A saved surface mesh is unrolled server-side (POST /api/surface/flatten, SCAF or ARAP) and
+// saved next to it. The flat view draws the sheet in its own small renderer (x, y in metres)
+// and fetches one binary blob (flatten.flat_binary): u32 V, u32 F, f32 uv[V*2], f32 xyz[V*3]
+// (world), u8 rgb (padded), u32 faces, f32 stretch[F], u8 kind[F] (padded; 1 = hole patch).
+// Clicking the sheet finds the triangle under the cursor and its barycentric position; the
+// same triangle and weights in 3D give the matching point on the surface, marked red in both.
+const flat = { key: null, entry: null, data: null, shade: store.get("flat.shade", "rgb"), running: false,
+  method: store.get("flat.method", "scaf"), pick: null, view: { cx: 0, cy: 0, s: 1000 }, queued: false };
+const flatCanvas = $("flat-canvas");
+const flatRenderer = new THREE.WebGLRenderer({ canvas: flatCanvas, antialias: true });
+flatRenderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const flatScene = new THREE.Scene();
+flatScene.background = BACKGROUND;
+const flatCam = new THREE.OrthographicCamera(-1, 1, 1, -1, -1, 1);
+const flatMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+const flatDot = new THREE.Group(); // 2D marker: red disc in a white ring, constant size on screen
+flatDot.add(new THREE.Mesh(new THREE.CircleGeometry(1.6, 32), new THREE.MeshBasicMaterial({ color: 0xffffff })));
+flatDot.add(new THREE.Mesh(new THREE.CircleGeometry(1.1, 32), new THREE.MeshBasicMaterial({ color: 0xff2020 })));
+flatDot.children.forEach((m, i) => (m.position.z = 0.1 + i * 0.1));
+flatDot.visible = false;
+flatScene.add(flatDot);
+// 3D marker on the surface, in the same (world) frame as the surface mesh.
+// No bloom: it would wash the red out to orange. Drawn on top so it's never hidden by the mesh.
+const pickMarker = new THREE.Mesh(new THREE.SphereGeometry(0.005, 20, 14),
+  new THREE.MeshBasicMaterial({ color: 0xff1010, depthTest: false, transparent: true }));
+pickMarker.renderOrder = 10;
+pickMarker.visible = false;
+sensorRoot.add(pickMarker);
+
+const srgbToLinear = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+const SRGB_LUT = Float32Array.from({ length: 256 }, (_, i) => srgbToLinear(i / 255));
+const STRETCH_RAMP = [new THREE.Color("#1d6f8a"), new THREE.Color("#ffd23d"), new THREE.Color("#ff2a2a")];
+const PATCH_GREY = new THREE.Color("#3a4450");
+function stretchColor(s, out) {
+  const t = Math.min(Math.max((s - 1) / 0.5, 0), 1) * 2; // 1 → 1.25 → ≥1.5
+  return t <= 1 ? out.lerpColors(STRETCH_RAMP[0], STRETCH_RAMP[1], t) : out.lerpColors(STRETCH_RAMP[1], STRETCH_RAMP[2], t - 1);
+}
+
+function parseFlat(buf) {
+  const dv = new DataView(buf);
+  const nv = dv.getUint32(0, true), nf = dv.getUint32(4, true);
+  let o = 8;
+  const uv = new Float32Array(buf, o, nv * 2); o += nv * 8;
+  const xyz = new Float32Array(buf, o, nv * 3); o += nv * 12;
+  const rgb = new Uint8Array(buf, o, nv * 3); o += Math.ceil(nv * 3 / 4) * 4;
+  const faces = new Uint32Array(buf, o, nf * 3); o += nf * 12;
+  const stretch = new Float32Array(buf, o, nf); o += nf * 4;
+  const kind = new Uint8Array(buf, o, nf);
+  return { nv, nf, uv, xyz, rgb, faces, stretch, kind };
+}
+
+function buildFlatMesh(d) {
+  // Non-indexed so STRETCH can colour whole triangles.
+  const pos = new Float32Array(d.nf * 9), rgb = new Float32Array(d.nf * 9), str = new Float32Array(d.nf * 9);
+  const c = new THREE.Color();
+  for (let f = 0; f < d.nf; f++) {
+    stretchColor(d.stretch[f], c);
+    if (d.kind[f]) c.copy(PATCH_GREY);
+    for (let k = 0; k < 3; k++) {
+      const v = d.faces[f * 3 + k], o = (f * 3 + k) * 3;
+      pos[o] = d.uv[v * 2]; pos[o + 1] = d.uv[v * 2 + 1]; pos[o + 2] = 0;
+      for (let j = 0; j < 3; j++) {
+        const lin = SRGB_LUT[d.rgb[v * 3 + j]];
+        rgb[o + j] = d.kind[f] ? lin * 0.35 + 0.02 : lin; // hole patches drawn dimmed
+      }
+      str[o] = c.r; str[o + 1] = c.g; str[o + 2] = c.b;
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute("color", new THREE.BufferAttribute(flat.shade === "stretch" ? str : rgb, 3));
+  geo.computeBoundingBox();
+  const mesh = new THREE.Mesh(geo, flatMat);
+  mesh.userData = { rgb, str };
+  return mesh;
+}
+
+function flatSize() { return [flatCanvas.clientWidth, flatCanvas.clientHeight]; }
+function drawFlat() {
+  if (flat.queued) return;
+  flat.queued = true;
+  requestAnimationFrame(() => {
+    flat.queued = false;
+    const [w, h] = flatSize();
+    if (!w || !h || !flat.mesh) return;
+    const { cx, cy, s } = flat.view;
+    Object.assign(flatCam, { left: cx - w / 2 / s, right: cx + w / 2 / s, top: cy + h / 2 / s, bottom: cy - h / 2 / s });
+    flatCam.updateProjectionMatrix();
+    flatDot.scale.setScalar(4 / s); // ≈ 6 px across, whatever the zoom
+    flatRenderer.render(flatScene, flatCam);
+    // Scale bar: a round length between ~50 and ~125 px.
+    const cm = [0.5, 1, 2, 5, 10, 20, 50].find((L) => (L / 100) * s >= 50) ?? 50;
+    $("flat-scale").style.width = `${(cm / 100) * s}px`;
+    $("flat-scale").textContent = `${cm} cm`;
+  });
+}
+new ResizeObserver(() => {
+  const [w, h] = flatSize();
+  if (w && h) { flatRenderer.setSize(w, h, false); drawFlat(); }
+}).observe(flatCanvas);
+
+function fitFlat() {
+  if (!flat.mesh) return;
+  const bb = flat.mesh.geometry.boundingBox, [w, h] = flatSize();
+  flat.view.cx = (bb.min.x + bb.max.x) / 2;
+  flat.view.cy = (bb.min.y + bb.max.y) / 2;
+  flat.view.s = Math.min(w / ((bb.max.x - bb.min.x) * 1.08), h / ((bb.max.y - bb.min.y) * 1.08)) || 1000;
+  drawFlat();
+}
+
+function setFlatShade(shade) {
+  flat.shade = shade;
+  store.set("flat.shade", shade);
+  setSeg("flat-shade", "shade", shade);
+  $("flat-legend").hidden = shade !== "stretch";
+  if (!flat.mesh) return;
+  const { rgb, str } = flat.mesh.userData;
+  flat.mesh.geometry.setAttribute("color", new THREE.BufferAttribute(shade === "stretch" ? str : rgb, 3));
+  drawFlat();
+}
+
+// Triangle under (x, y) in flat coordinates, with barycentric weights; null if off the sheet.
+function flatFaceAt(x, y) {
+  const { uv, faces, nf } = flat.data;
+  for (let f = 0; f < nf; f++) {
+    const a = faces[f * 3] * 2, b = faces[f * 3 + 1] * 2, c = faces[f * 3 + 2] * 2;
+    const ax = uv[a], ay = uv[a + 1], bx = uv[b], by = uv[b + 1], cx = uv[c], cy = uv[c + 1];
+    if (x < Math.min(ax, bx, cx) || x > Math.max(ax, bx, cx) || y < Math.min(ay, by, cy) || y > Math.max(ay, by, cy)) continue;
+    const det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+    if (!det) continue;
+    const w0 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / det;
+    const w1 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / det;
+    const w2 = 1 - w0 - w1;
+    if (w0 >= -1e-6 && w1 >= -1e-6 && w2 >= -1e-6) return { f, w: [w0, w1, w2] };
+  }
+  return null;
+}
+
+function pickFlat(x, y) {
+  const hit = flatFaceAt(x, y);
+  if (!hit) return;
+  const { xyz, faces, stretch, kind } = flat.data;
+  const p = [0, 0, 0];
+  for (let k = 0; k < 3; k++) {
+    const v = faces[hit.f * 3 + k];
+    for (let j = 0; j < 3; j++) p[j] += hit.w[k] * xyz[v * 3 + j];
+  }
+  flat.pick = { uv: [x, y], xyz: p, face: hit.f };
+  flatDot.position.set(x, y, 0);
+  flatDot.visible = true;
+  pickMarker.position.fromArray(p);
+  updatePickMarker();
+  $("flat-pick").innerHTML = "<b>●</b> <span></span>";
+  $("flat-pick").querySelector("span").textContent =
+    `flat ${(x * 100).toFixed(1)}, ${(y * 100).toFixed(1)} cm · 3D ${p.map((v) => v.toFixed(3)).join(", ")} m · ` +
+    `stretch ${stretch[hit.f].toFixed(2)}` + (kind[hit.f] ? " · in a filled hole" : "") +
+    (pickMarker.visible ? "" : " · open its surface mesh to see it in 3D");
+  drawFlat();
+}
+
+function clearPick() {
+  flat.pick = null;
+  flatDot.visible = false;
+  pickMarker.visible = false;
+  $("flat-pick").textContent = "Click the flat sheet to mark a point.";
+  drawFlat();
+}
+
+// The 3D marker shows only while the flat mesh's own source surface is on screen.
+function updatePickMarker() {
+  pickMarker.visible = !!flat.pick && !!surface.mesh && sameKey(surface.id, flat.entry?.source);
+}
+
+// Pan (drag), zoom (wheel, about the cursor), pick (click without dragging).
+let flatDrag = null;
+const flatPoint = (ev) => {
+  const r = flatCanvas.getBoundingClientRect(), [w, h] = flatSize(), { cx, cy, s } = flat.view;
+  return [cx + (ev.clientX - r.left - w / 2) / s, cy - (ev.clientY - r.top - h / 2) / s];
+};
+flatCanvas.addEventListener("pointerdown", (ev) => {
+  flatDrag = { x: ev.clientX, y: ev.clientY, cx: flat.view.cx, cy: flat.view.cy, moved: false };
+  flatCanvas.setPointerCapture(ev.pointerId);
+});
+flatCanvas.addEventListener("pointermove", (ev) => {
+  if (!flatDrag) return;
+  const dx = ev.clientX - flatDrag.x, dy = ev.clientY - flatDrag.y;
+  if (!flatDrag.moved && Math.hypot(dx, dy) < 4) return;
+  flatDrag.moved = true;
+  flatCanvas.classList.add("dragging");
+  flat.view.cx = flatDrag.cx - dx / flat.view.s;
+  flat.view.cy = flatDrag.cy + dy / flat.view.s;
+  drawFlat();
+});
+flatCanvas.addEventListener("pointerup", (ev) => {
+  if (flatDrag && !flatDrag.moved && flat.data) pickFlat(...flatPoint(ev));
+  flatDrag = null;
+  flatCanvas.classList.remove("dragging");
+});
+flatCanvas.addEventListener("wheel", (ev) => {
+  ev.preventDefault();
+  if (!flat.mesh) return;
+  const [x, y] = flatPoint(ev), k = Math.exp(-ev.deltaY * 0.0015);
+  flat.view.s *= k;
+  flat.view.cx = x - (x - flat.view.cx) / k;
+  flat.view.cy = y - (y - flat.view.cy) / k;
+  drawFlat();
+}, { passive: false });
+
+async function loadFlat(key) {
+  const [side, bin] = await Promise.all([fetch(meshUrl(key, "json")), fetch(meshUrl(key, "flat"))]);
+  if (!side.ok || !bin.ok) throw new Error("flat mesh files missing");
+  const entry = await side.json();
+  closeFlat();
+  flat.key = { recording: key.recording, stem: key.stem };
+  flat.entry = entry;
+  flat.data = parseFlat(await bin.arrayBuffer());
+  flat.mesh = buildFlatMesh(flat.data);
+  flatScene.add(flat.mesh);
+  $("flat-result").hidden = false;
+  $("flat-state").textContent = entry.flatten_method.toUpperCase();
+  setFlatShade(flat.shade);
+  renderFlatStats(entry);
+  renderLibrary();
+  requestAnimationFrame(fitFlat); // after the canvas has its size
+}
+
+function closeFlat() {
+  if (flat.mesh) { flatScene.remove(flat.mesh); flat.mesh.geometry.dispose(); flat.mesh = null; }
+  flat.key = flat.entry = flat.data = null;
+  clearPick();
+  $("flat-result").hidden = true;
+}
+
+function renderFlatStats(entry) {
+  const s = entry.stats, d = s.distortion;
+  const cells = [
+    ["METHOD", s.title], ["SIZE", `${s.size_cm[0].toFixed(1)} × ${s.size_cm[1].toFixed(1)} cm`],
+    ["TRIANGLES", s.faces.toLocaleString()],
+    ["STRETCH", `${d.stretch_p50.toFixed(3)} median · ${d.stretch_p95.toFixed(3)} p95 · ${d.stretch_max.toFixed(2)} max`, "wide"],
+    ["AREA", `${s.area_cm2.toFixed(0)} cm² flat · ${s.source_area_cm2.toFixed(0)} cm² 3D (${((d.area_ratio - 1) * 100).toFixed(2)} %)`, "wide"],
+    ["SOLVER", `${s.optimization.iterations} of ${s.optimization.iteration_limit} iterations · ${s.build_s.toFixed(1)} s`, "wide"],
+  ];
+  if (s.repair?.hole_patch_faces) cells.push(["HOLES", `${s.repair.hole_patch_faces} patch triangles (dimmed)`, "wide"]);
+  cells.push(["FROM", `Meshes/${entry.source.recording}/${entry.source.stem}.ply`, "wide"]);
+  cells.push(["SAVED AS", `Meshes/${entry.recording}/${entry.stem}.ply`, "wide"]);
+  $("flat-stats").replaceChildren(...cells.map(([k, v, cls]) => {
+    const el = document.createElement("div");
+    if (cls) el.className = cls;
+    el.innerHTML = "<dt></dt><dd></dd>";
+    el.firstChild.textContent = k; el.lastChild.textContent = v;
+    return el;
+  }));
+}
+
+// Source picker: every saved surface mesh (not the flat ones), grouped by recording.
+function renderFlatSources() {
+  const sel = $("flat-source");
+  const keep = sel.value;
+  const items = library.items.filter((e) => e.method !== "flat");
+  const groups = new Map();
+  for (const e of items) {
+    if (!groups.has(e.recording)) groups.set(e.recording, []);
+    groups.get(e.recording).push(e);
+  }
+  sel.replaceChildren(...[...groups].map(([rec, list]) => {
+    const g = document.createElement("optgroup");
+    g.label = rec;
+    g.append(...list.map((e) => {
+      const o = document.createElement("option");
+      o.value = `${e.recording}/${e.stem}`;
+      o.textContent = `FRAME ${e.frame} · ${mmss(e.time_s)} · ${(e.faces ?? 0).toLocaleString()} tris · ${e.created.slice(5, 16).replace("T", " ")}`;
+      return o;
+    }));
+    return g;
+  }));
+  if (!items.length) sel.append(new Option("No saved meshes yet: BUILD MESH first", ""));
+  const shown = surface.id && surface.entry?.method !== "flat" ? `${surface.id.recording}/${surface.id.stem}` : null;
+  const here = items.find((e) => e.recording === library.recording);
+  for (const v of [keep, shown, here && `${here.recording}/${here.stem}`]) {
+    if (v && [...sel.options].some((o) => o.value === v)) { sel.value = v; break; }
+  }
+  $("flat-run").disabled = flat.running || !sel.value;
+  $("flat-run").title = sel.value ? "Unroll the selected mesh" : "Pick a saved mesh first";
+}
+const flatSourceKey = () => {
+  const v = $("flat-source").value, i = v.indexOf("/");
+  return v ? { recording: v.slice(0, i), stem: v.slice(i + 1) } : null;
+};
+
+// Show the flat mesh's source surface in 3D (opens its recording at that frame if needed).
+function showFlatSource(src) {
+  if (!src || sameKey(surface.id, src)) return;
+  const item = library.items.find((e) => sameKey(e, src));
+  if (item) openSaved(item);
+}
+
+function onFlatProgress(msg) {
+  if (!flat.running) return;
+  const bar = $("flat-progress");
+  bar.hidden = false;
+  bar.querySelector("i").style.width = `${Math.round(msg.progress * 100)}%`;
+  if (msg.stage !== "done") $("flat-msg").textContent = `${msg.stage.toUpperCase()}… ${Math.round(msg.progress * 100)}%`;
+}
+
+$("flat-run").onclick = async () => {
+  const src = flatSourceKey();
+  if (flat.running || !src) return;
+  flat.running = true;
+  const btn = $("flat-run");
+  btn.textContent = "FLATTENING…"; btn.classList.add("busy"); btn.disabled = true;
+  $("flat-state").textContent = "RUNNING";
+  $("flat-msg").className = "rig-msg";
+  $("flat-msg").textContent = "Starting…";
+  $("flat-progress").hidden = false;
+  $("flat-progress").querySelector("i").style.width = "0%";
+  try {
+    const r = await fetch("/api/surface/flatten", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...src, method: flat.method, iterations: +$("flat-iters").value }),
+    });
+    const res = await r.json();
+    if (!r.ok) throw new Error(res.error ?? `HTTP ${r.status}`);
+    await loadFlat({ recording: res.recording, stem: res.stem });
+    showFlatSource(src);
+    const w = res.stats.warnings ?? [];
+    $("flat-msg").className = w.length ? "rig-msg" : "rig-msg ok";
+    $("flat-msg").textContent = (w.length ? w.join(" ") + " " : `Flattened in ${res.stats.build_s.toFixed(1)} s. `) +
+      `Saved to Meshes/${res.recording}/${res.stem}.ply`;
+    loadLibrary();
+  } catch (e) {
+    $("flat-state").textContent = "FAILED";
+    $("flat-msg").className = "rig-msg err";
+    $("flat-msg").textContent = e.message;
+  } finally {
+    flat.running = false;
+    btn.textContent = "FLATTEN"; btn.classList.remove("busy");
+    renderFlatSources();
+    setTimeout(() => { if (!flat.running) $("flat-progress").hidden = true; }, 800);
+  }
+};
+
+$("flat-source").onchange = () => renderFlatSources();
+document.querySelectorAll("#flat-method button").forEach((b) => (b.onclick = () => {
+  flat.method = b.dataset.method; store.set("flat.method", flat.method); setSeg("flat-method", "method", flat.method);
+}));
+setSeg("flat-method", "method", flat.method);
+$("flat-iters").value = store.get("flat.iters", 50);
+$("flat-iters").parentElement.querySelector("b span").textContent = $("flat-iters").value;
+$("flat-iters").oninput = (e) => {
+  e.target.parentElement.querySelector("b span").textContent = e.target.value; store.set("flat.iters", +e.target.value);
+};
+document.querySelectorAll("#flat-shade button").forEach((b) => (b.onclick = () => setFlatShade(b.dataset.shade)));
+$("flat-fit").onclick = fitFlat;
+$("flat-unpick").onclick = clearPick;
+$("flat-ply").onclick = () => {
+  if (!flat.key) return;
+  const a = document.createElement("a"); a.href = meshUrl(flat.key, "ply"); a.download = "";
+  document.body.append(a); a.click(); a.remove();
+};
+$("flat-clear").onclick = () => { closeFlat(); $("flat-state").textContent = "—"; renderLibrary(); };
+setFlatShade(flat.shade);
 loadLibrary();
 
 // ───────────────────────────── render loop ─────────────────────────────
