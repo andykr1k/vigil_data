@@ -173,6 +173,85 @@ def list_meshes(request: Request, recording: str | None = None) -> Response:
     return JSONResponse({"root": str(root), "items": MeshLibrary(root).list(recording)})
 
 
+def _recording_dir(request: Request, recording: str) -> Path:
+    cfg = request.app.state.pipeline.cfg
+    root = getattr(request.app.state, "recordings_root", None) or cfg.resolve(cfg.recording.dir)
+    if not recording or "/" in recording or recording.startswith("."):
+        raise ValueError("bad recording name")
+    return Path(root) / recording
+
+
+@router.get("/{recording}/{stem}/report")
+def report(request: Request, recording: str, stem: str) -> Response:
+    """Everything the pipeline page shows for one saved mesh: its sidecar, the recording's
+    cameras (to project the knee / hip into the images) and the flattened meshes made from it."""
+    library = MeshLibrary(meshes_root(request))
+    try:
+        entry = json.loads(library.path(recording, stem, "json").read_text())
+    except (ValueError, OSError):
+        return Response(status_code=404)
+    cameras = []
+    try:
+        meta = json.loads((_recording_dir(request, recording) / "meta.json").read_text())
+        cameras = [{k: c.get(k) for k in ("index", "serial", "width", "height", "fx", "fy", "cx", "cy",
+                                           "T_world_camera")} for c in meta.get("cameras", [])]
+    except (ValueError, OSError):
+        pass
+    flats = [e for e in library.list(recording)
+             if e.get("method") == "flat" and (e.get("source") or {}).get("stem") == stem]
+    return JSONResponse({"entry": entry, "cameras": cameras, "flats": flats})
+
+
+@router.get("/{recording}/{stem}/image/{cam}/{kind}")
+def stage_image(request: Request, recording: str, stem: str, cam: int, kind: str) -> Response:
+    """The images behind the pipeline page, for camera `cam` on the frame the stage map follows
+    (or, for meshes saved before stage maps, the mesh's own frame): kind = color (JPEG),
+    depth (colourised PNG), label (the stage map as a PNG, raw values 0-6)."""
+    import cv2
+    import numpy as np
+
+    library = MeshLibrary(meshes_root(request))
+    try:
+        entry = json.loads(library.path(recording, stem, "json").read_text())
+        rec = _recording_dir(request, recording)
+        info = ((entry.get("stages") or {}).get("cameras") or {}).get(str(cam))
+        if kind == "label":
+            label = library.stage_label(recording, stem, cam)
+            if label is None:
+                return Response(status_code=404)
+            return Response(cv2.imencode(".png", label)[1].tobytes(), media_type="image/png")
+        if info is not None:
+            rel = info["color" if kind == "color" else "depth"]
+        else:  # older mesh: the recording's files at the mesh's frame
+            line = None
+            with open(rec / "frames.jsonl") as f:
+                for i, ln in enumerate(f):
+                    if i == entry["index"]:
+                        line = json.loads(ln)
+                        break
+            files = [x for x in (line or {}).get("files", []) if x.get("cam") == cam]
+            rel = next((x.get("color" if kind == "color" else "depth") for x in files
+                        if x.get("color" if kind == "color" else "depth")), None)
+        if rel is None or kind not in ("color", "depth"):
+            return Response(status_code=404)
+        path = (rec / rel).resolve()
+        if rec.resolve() not in path.parents or not path.is_file():
+            return Response(status_code=404)
+    except (ValueError, OSError, KeyError):
+        return Response(status_code=404)
+    if kind == "color":
+        return FileResponse(path, media_type="image/jpeg")
+    depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if depth is None:
+        return Response(status_code=404)
+    valid = depth > 0
+    lo, hi = (np.percentile(depth[valid], [2, 98]) if valid.any() else (0, 1))
+    norm = np.clip((depth.astype(np.float32) - lo) / max(hi - lo, 1), 0, 1)
+    img = cv2.applyColorMap((255 - norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    img[~valid] = 0
+    return Response(cv2.imencode(".png", img)[1].tobytes(), media_type="image/png")
+
+
 @router.get("/{recording}/{stem}.{ext}")
 def mesh_file(request: Request, recording: str, stem: str, ext: str) -> Response:
     library = MeshLibrary(meshes_root(request))

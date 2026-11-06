@@ -142,3 +142,43 @@ def test_library_saves_lists_loads_and_deletes(tmp_path):
 
     lib.delete(path.name, entry["stem"])
     assert lib.list() == [] and not (tmp_path / "Meshes" / path.name).exists()
+
+
+def test_stage_maps_record_what_each_stage_removed(tmp_path):
+    """The seat is cut by the support stage; the stage map and the pipeline-page endpoints say so."""
+    from fastapi.testclient import TestClient
+
+    from vigil.config import load_config
+    from vigil.server import create_app
+
+    path, meta, lines = make_recording(tmp_path / "rec", seat=True)
+    params = TsdfParams(section="whole", voxel_mm=2, trunc_mm=8, below_cm=8, largest=False)
+    mesh = build_tsdf(path, meta, lines, 1, params, limb_radius=LIMB)
+    cam = mesh.stages["cameras"][0]
+    label = cam["label"]
+    seat = cylinder_depth(seat=True) > cylinder_depth() + 1e-6  # seat pixels: depth only with the seat
+    assert label.shape == (H, W)
+    in_region = seat & (label > 0)                               # seat inside the leg capsule
+    assert in_region.sum() > 100 and (label[in_region] == 3).mean() > 0.9  # cut as support
+    assert (label[cylinder_depth() > 0] == 6).mean() > 0.8       # the leg was fused
+    assert cam["pixels"]["support"] == int((label == 3).sum()) and cam["pixels"]["kept"] > 0
+
+    lib = MeshLibrary(tmp_path / "Meshes")
+    entry = lib.save(mesh, path, lines, 1, window_s=0.5)
+    assert entry["files"]["stages"] == f"{entry['stem']}.npz"
+    np.testing.assert_array_equal(lib.stage_label(path.name, entry["stem"], 0), label)
+
+    app = create_app(load_config())  # no lifespan: the pipeline isn't started
+    app.state.meshes_root = tmp_path / "Meshes"
+    app.state.recordings_root = path.parent
+    client = TestClient(app)
+    base = f"/api/surface/{path.name}/{entry['stem']}"
+    report = client.get(f"{base}/report").json()
+    assert report["entry"]["stem"] == entry["stem"] and report["cameras"][0]["fx"] == F
+    for kind, mime in (("color", "image/jpeg"), ("depth", "image/png"), ("label", "image/png")):
+        r = client.get(f"{base}/image/0/{kind}")
+        assert r.status_code == 200 and r.headers["content-type"] == mime, kind
+    assert client.get(f"{base}/image/0/nope").status_code == 404
+    assert client.get("/pipeline.html").status_code == 200
+    lib.delete(path.name, entry["stem"])
+    assert not (tmp_path / "Meshes" / path.name).exists()

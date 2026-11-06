@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VIGIL · Mesh pipeline</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2 L29 9.5 V22.5 L16 30 L3 22.5 V9.5 Z' fill='%2302050a' stroke='%2322e4ff' stroke-width='2'/%3E%3Ccircle cx='16' cy='15' r='4' fill='%2322e4ff'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <script type="importmap">
+    { "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/" } }
+  </script>
+  <style>
+    :root {
+      --bg: #02050a; --panel: #07111f; --edge: rgba(90, 220, 255, 0.18);
+      --cyan: #22e4ff; --mag: #ff3df2; --ok: #3dffa8; --warn: #ffc53d; --err: #ff4d6a;
+      --text: #cfe9ff; --dim: #6f8ba8;
+      --display: "Orbitron", system-ui, sans-serif;
+      --mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 12.5px/1.5 var(--mono); }
+    main { max-width: 1280px; margin: 0 auto; padding: 20px 16px 60px; }
+    a { color: var(--cyan); }
+    header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: flex-end; justify-content: space-between;
+             border-bottom: 1px solid var(--edge); padding-bottom: 14px; margin-bottom: 18px; }
+    h1 { font: 700 20px/1.2 var(--display); letter-spacing: .08em; margin: 0 0 4px; color: var(--cyan); }
+    header .sub { color: var(--dim); }
+    header .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+    .btn { font: 600 11px var(--mono); letter-spacing: .06em; color: var(--cyan); background: transparent;
+           border: 1px solid var(--edge); border-radius: 3px; padding: 6px 10px; text-decoration: none; cursor: pointer; }
+    .btn:hover { border-color: var(--cyan); }
+    .flow { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px; }
+    .flow a { font-size: 11px; text-decoration: none; padding: 4px 8px; border: 1px solid var(--edge); border-radius: 12px; color: var(--text); }
+    .flow a.off { color: var(--dim); opacity: .6; }
+    .flow a.warn { border-color: var(--warn); color: var(--warn); }
+    .card { background: var(--panel); border: 1px solid var(--edge); border-radius: 6px; padding: 14px 16px; margin-bottom: 14px; }
+    .card.off { opacity: .55; }
+    .card h2 { font: 700 13px var(--display); letter-spacing: .08em; margin: 0; display: flex; gap: 10px; align-items: center; }
+    .card h2 .n { color: var(--cyan); }
+    .card h2 .chip { font: 600 10px var(--mono); padding: 1px 6px; border-radius: 9px; border: 1px solid currentColor; letter-spacing: .04em; }
+    .chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); } .chip.off { color: var(--dim); } .chip.err { color: var(--err); }
+    .card .what { color: var(--dim); margin: 4px 0 10px; max-width: 900px; }
+    .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px 18px; margin: 8px 0; }
+    .kv div { border-left: 2px solid var(--edge); padding-left: 8px; }
+    .kv b { display: block; font-size: 10px; color: var(--dim); font-weight: 400; letter-spacing: .05em; text-transform: uppercase; }
+    .kv span.bad { color: var(--warn); }
+    .imgs { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 10px; margin-top: 8px; }
+    .imgs.four { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+    .imgs.flats { grid-template-columns: repeat(auto-fill, minmax(420px, 620px)); }
+    figure { margin: 0; }
+    figure canvas, figure img { width: 100%; display: block; border-radius: 4px; background: #000; }
+    figcaption { color: var(--dim); font-size: 11px; margin-top: 4px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px; color: var(--dim); margin-top: 6px; }
+    .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+    ul.warn { margin: 6px 0 0; padding-left: 18px; color: var(--warn); }
+    #viewer { width: 100%; height: 440px; border-radius: 4px; background: #000; margin-top: 8px; position: relative; }
+    .note { color: var(--dim); font-size: 11px; }
+    .err { color: var(--err); }
+    table { border-collapse: collapse; width: 100%; font-size: 11.5px; }
+    td, th { text-align: left; padding: 3px 8px 3px 0; border-bottom: 1px solid var(--edge); }
+    th { color: var(--dim); font-weight: 400; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1 id="title">MESH PIPELINE</h1>
+        <div class="sub" id="sub">Loading…</div>
+      </div>
+      <div class="acts">
+        <a class="btn" id="ply" href="#" download>DOWNLOAD PLY</a>
+        <a class="btn" id="json" href="#" target="_blank">RAW JSON</a>
+        <a class="btn" href="/">DASHBOARD</a>
+      </div>
+    </header>
+    <nav class="flow" id="flow"></nav>
+    <div id="cards"></div>
+  </main>
+  <script type="module" src="pipeline.js"></script>
+</body>
+</html>

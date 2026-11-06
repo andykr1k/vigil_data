@@ -107,6 +107,9 @@ class Mesh:
     normals: np.ndarray   # (V, 3) float32
     colors: np.ndarray    # (V, 3) uint8
     stats: dict = field(default_factory=dict)
+    # What each pipeline stage kept, per camera, on the frame nearest the mesh's time (see
+    # _StageTrace); saved as the mesh's .npz for the pipeline page. Not part of the PLY.
+    stages: dict = field(default_factory=dict)
 
     def to_binary(self) -> bytes:
         """u32 V, u32 F, f32 xyz[V*3], f32 normals[V*3], u8 rgb[V*3] (padded to 4), u32 faces[F*3]."""
@@ -875,6 +878,53 @@ def _normals(verts, faces):
 
 
 # ---------------------------------------------------------------------- entry point
+# Pixel labels of a stage map: why a pixel of the leg region did or didn't reach the fusion.
+STAGE_LABELS = {
+    0: "outside the leg region",
+    1: "no usable depth (depth window, flying-pixel edges, mask rim)",
+    2: "outside the BOX",
+    3: "on the support surface",
+    4: "past the knee / hip cut",
+    5: "outside the thigh tube",
+    6: "kept: fused into the mesh",
+}
+
+
+class _StageTrace:
+    """Follows one depth frame per camera (the one nearest the mesh's time) through the build:
+    after each stage, which of its pixels are still kept. The result is one label map per
+    camera (STAGE_LABELS): the stage that removed each pixel, or 6 if it was fused."""
+
+    STAGES = ("depth", "box", "support", "section", "tube")  # label 1..5, in build order
+
+    def __init__(self, entries: list[dict], t_mid: float, masks: dict[int, np.ndarray | None]):
+        self.centre: dict[int, dict] = {}
+        for e in entries:
+            cam = e["view"].cam
+            if cam not in self.centre or abs(e["view"].t - t_mid) < abs(self.centre[cam]["view"].t - t_mid):
+                self.centre[cam] = e
+        self.kept = {cam: [masks.get(cam) if masks.get(cam) is not None else e["seg"] > 0, e["seg"] > 0]
+                     for cam, e in self.centre.items()}
+
+    def snap(self) -> None:
+        for cam, e in self.centre.items():
+            self.kept[cam].append(e["seg"] > 0)
+
+    def result(self) -> dict:
+        out = {}
+        for cam, e in self.centre.items():
+            sets = self.kept[cam]
+            label = np.zeros(sets[0].shape, np.uint8)
+            for i in range(1, len(sets)):
+                label[sets[i - 1] & ~sets[i]] = i
+            label[sets[-1]] = 6
+            out[cam] = {"label": label, "color": str(e["view"].color), "depth": str(e["view"].depth),
+                        "t": e["view"].t,
+                        "pixels": {name: int((label == k).sum())
+                                   for k, name in enumerate(("no_depth",) + self.STAGES[1:] + ("kept",), 1)}}
+        return out
+
+
 def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfParams,
                progress=lambda stage, frac: None, limb_radius: float = 0.06) -> Mesh:
     """Mesh the leg at frame `index` of the recording at `path` (`lines` = its frames.jsonl).
@@ -966,6 +1016,14 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
         raise MeshError("Nothing inside the depth window.")
     warnings, support, align_stats = list(warnings_sam), None, None
     support_removed = 0.0
+    centre_masks = {}
+    if sam is not None:
+        for cam, r in sam.items():
+            near = [e for e in entries if e["view"].cam == cam]
+            if near:
+                e = min(near, key=lambda e: abs(e["view"].t - lines[index]["t"]))
+                centre_masks[cam] = r["masks"].get(line_of[str(e["view"].depth)])
+    trace = _StageTrace(entries, lines[index]["t"], centre_masks)
 
     # 2. Align. Each camera's frame nearest the current time is snapped onto the world
     #    camera's (absorbing calibration error, with the slide along the leg locked); every
@@ -982,6 +1040,7 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
         entries = [e for e in entries if e["seg"].any() and len(e["pts"])]
         if not entries:
             raise MeshError("Nothing with depth inside the BOX. Draw it around the thigh again.")
+    trace.snap()  # box
 
     # 3. Cut away what the leg rests on.
     pts = np.concatenate([e["pts"] for e in entries])
@@ -999,6 +1058,7 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
             support_removed = 1 - len(pts) / max(n_before, 1)
             if not len(pts):
                 raise MeshError("Everything lies on the support surface; turn 'cut support' off.")
+    trace.snap()  # support
 
     # 3b. Keep one side of the knee ("knee": the clicked knee; the axis points into the kept side,
     #     so it keeps the same side as "above").
@@ -1040,6 +1100,7 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
             raise MeshError("Nothing left on that side of the knee. Check KNEE SHIFT, or use WHOLE LEG."
                             if p.section != "knee" else "Nothing left on that side of the knee. Check KNEE SHIFT and the KNEE click.")
         warnings.extend(section.pop("warnings"))
+    trace.snap()  # section
 
     # 3c. Thigh tube: SAM keeps a garment whole, so drop what's far from the thigh's axis.
     if section is not None and p.section == "knee" and p.tube:
@@ -1061,6 +1122,7 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
             section["tube"] = {"radius_cm": [round(float(_tube_radius(tube, tube["t0"])) * 100, 1),
                                              round(float(_tube_radius(tube, s_top)) * 100, 1)],
                                "removed": round(1 - len(pts) / max(n_before, 1), 3)}
+    trace.snap()  # tube
     if segmentation is not None:
         segmentation["support_removed"] = round(support_removed, 3)
 
@@ -1123,4 +1185,5 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
         "params": asdict(p), "warnings": warnings,
     }
     log.info("TSDF mesh: %s", {k: v for k, v in stats.items() if k != "params"})
-    return Mesh(verts.astype(np.float32), faces.astype(np.uint32), normals, colors, stats)
+    return Mesh(verts.astype(np.float32), faces.astype(np.uint32), normals, colors, stats,
+                stages={"cameras": trace.result(), "labels": STAGE_LABELS})

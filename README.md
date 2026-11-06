@@ -55,7 +55,15 @@ Every connected RealSense is used (or the `cameras.serials` list). The first ser
 
 Each still frame gives `T_world←cam = T_world←cube · T_cam←cube⁻¹`. Frames where the cube moved, flipped poses, and outliers are rejected. The rest are averaged (chordal mean for rotation). The result goes to `configs/extrinsics.yaml` with its standard error. Once calibrated, a camera's point cloud and frustum join the fused scene, its body keypoints are triangulated with the others, and its tag corners join the probe solve.
 
-**Calibration health:** whenever the world camera and another camera each see the probe on their own, the RIG panel shows how well their poses agree (rolling median, e.g. "agrees with CAM 1 to 4 mm / 1.1° (GOOD)"). If it turns FAIR or POOR, a camera was probably bumped, so recalibrate.
+**With fixed tags instead of the probe (`testing.probe: 0`).** CALIBRATE RIG then uses ArUco tags fixed in the scene (`world_tags` in the config: any DICT_6X6_50 tag except the cube's 0–4 by default, `marker_length_m` = printed black square). Print them from `/api/probe/tag/{id}.png`. Nothing has to be held still or measured, and it finishes in about 2 s (`src/vigil/world_tags.py`):
+
+1. Every camera watches the tags. Per camera and tag, the per-frame PnP corners are reduced to their median, which removes jitter and single-tag pose flips.
+2. With `use_depth`, each tag is slid along its viewing ray to the median measured depth inside it. PnP's distance to a small tag is biased: an 8 cm tag at 1.5 m seen at an angle comes out 1–4 cm too far, and that doesn't average away. A camera whose depth calibration has drifted reads a few percent short. That shrinks its whole tag layout, so the outer tags misfit and would be dropped. Such an error is one factor per camera, and with 3+ tags it shows as the two layouts differing in size, so it is measured and divided out ("depth, rescaled"). Every candidate is fitted: each camera with depth or PnP, plus the rescaled depth. The one where the most tags agree, then the smallest error, is kept. `distance_from` and `depth_correction` in `configs/extrinsics.yaml` say which was used. Our CAM 2 (…8549) read about 5% short: depth ÷ PnP 0.94 while CAM 1 read 1.00. A simulated 5% short camera reproduces it (0.938, two tags dropped); rescaled, the error falls from 41 mm to 4 mm.
+3. Camera k is placed by one rigid (Kabsch) fit of its tag corners onto the world camera's, over every tag both see. A tag that doesn't fit the others by 10 mm is dropped. The panel reports the tags used and the fit in mm.
+
+The layout doesn't matter and the tags needn't be coplanar. Coplanar is fine as long as they aren't in a line. What matters is that each camera sees **3+ of the same tags, spread out**: then the rotation comes from where the tags are relative to each other, not from one small tag's tilt (1° of tilt at 1.5 m moves the camera 2.6 cm). With fewer, it still calibrates but warns. Our cameras face each other, so lay the tags flat on the floor or table where both see their faces; tags on a wall are seen by one camera only. On rendered images: 4 mm / 0.16° with depth vs 34 mm / 2° with PnP alone. Each 1% depth-scale mismatch between the two cameras adds about 1 cm, so if the fit grows, check the cameras' depth calibration. `depth_scale` in `configs/extrinsics.yaml` (depth ÷ PnP distance) also flags a wrong `marker_length_m`.
+
+**Calibration health:** whenever the world camera and another camera each see the probe on their own, the RIG panel shows how well their poses agree (rolling median, e.g. "agrees with CAM 1 to 4 mm / 1.1° (GOOD)"). If it turns FAIR or POOR, a camera was probably bumped, so recalibrate. Each camera's pose is first refined with its own depth. Without that, a camera's tags alone are weak along its line of sight: 1–3 cm for a 4 cm tag at 1 m. Our cameras face each other, so their errors point in opposite directions. A good calibration then read 14 mm / 3.4° (FAIR), and the tracker kept switching to one camera. The same depth-refined poses decide when the tracker uses one camera only.
 
 **Time sync:** frames carry the cameras' own capture timestamps (librealsense global time), and each other camera's frame is paired with the world camera's by capture time. If the other camera's next frame is closer and only milliseconds away, the pairing waits for it. The RIG header shows the remaining skew.
 
@@ -122,6 +130,16 @@ Every build is saved to `Meshes/<recording>/frame<N>_t<seconds>s_tsdf_<created>.
 `seq`, the time window that was fused, every setting and the stats. **SAVED MESHES** lists them;
 clicking one replays its recording paused at that frame with the mesh shown, and gold marks
 under the replay slider jump to them. Meshes are in the world frame (metres), like `cloud/*.ply`.
+
+**STEPS** on a saved mesh opens `pipeline.html` in a new tab, with one card per pipeline stage:
+input frames (colour and depth), leg region (mask, clicks, auto votes), depth cleanup, ICP
+alignment, box, support surface, knee/hip cut and thigh tube (knee and hip projected into the
+images), fusion, the 3D surface, and its flattened versions coloured by stretch. Each card has
+that stage's numbers from the JSON. Since this page was added, every build also saves a `.npz`
+with one label map per camera, on the frame nearest the mesh's time. Each pixel of the leg region
+records the stage that removed it, or that it was fused (`tsdf.STAGE_LABELS`). The cards draw
+these maps over the colour image, so you can see what each stage removed. Meshes saved earlier get
+the numbers and images but no overlays.
 
 ### SAM 2 THIGH: the thigh without the recorded pose (AUTO, clicks, BOX)
 

@@ -82,6 +82,16 @@ probe:
   max_rig_error_px: 3.0         # cameras disagreeing by more (stale rig calibration) → track from one camera
   max_depth_error_mm: 15.0      # ignore measured depth that disagrees with the tags by more
 
+world_tags:
+  # ArUco tags fixed in the scene (floor, table…), used by CALIBRATE RIG when testing.probe = 0.
+  # Any layout works and they needn't be measured or coplanar. Each camera must see 3+ of the
+  # same tags, spread out (not in a line); tags lying flat suit cameras on opposite sides.
+  dictionary: DICT_6X6_50
+  marker_length_m: 0.075        # printed black square, excluding the white margin
+  ids: [5, 6, 7, 8]             # null = every tag except the probe cube's 0-4
+  min_views: 10                 # frames a camera must see a tag in before it counts
+  use_depth: true               # tag distance from measured depth (PnP alone is biased 1-4 cm)
+
 clarius:
   # Clarius ultrasound over the Solum SDK, connected directly (no Clarius App): join the
   # probe's Wi-Fi with a spare adapter; the certificate goes in .env as CLARIUS_CERT_PATH.
@@ -128,3 +138,4 @@ server:
 
 testing:
   mode: 0
+  probe: 0      # rig calibration (where each camera is): 1 = probe cube, 0 = world_tags

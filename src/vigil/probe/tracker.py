@@ -60,6 +60,11 @@ class ProbeFrame:
     world_poses: dict[str, ObjectPose] = field(default_factory=dict)  # per calibrated camera
     refined: Refined | None = None
     rig_error_px: float | None = None  # joint fit when the cameras disagree (→ recalibrate)
+    # Per calibrated camera, its world pose refined with its own depth (else = world_poses):
+    # what "do the cameras agree?" compares. A camera's tags alone are weak along its viewing
+    # ray (1-3 cm on a 4 cm tag at 1 m), and cameras facing each other err in opposite
+    # directions, so comparing tag-only poses flags a good calibration as disagreeing.
+    compare_poses: dict[str, ObjectPose] = field(default_factory=dict)
 
 
 def _to_h(p: ObjectPose) -> np.ndarray:
@@ -192,9 +197,10 @@ class ProbeTracker:
                      for c in inputs
                      if c.T_world_cam is not None and c.serial in out.world_poses}
             out.refined = self._refine(list(views.values()), init)
+            out.compare_poses = self._own_depth_poses(views, out.world_poses) if len(views) > 1 else {}
             if out.refined is not None and len(views) > 1 and (
                     out.refined.rms_px > self.cfg.max_rig_error_px
-                    or self._views_disagree(views, out.world_poses)):
+                    or self._views_disagree(views, out.compare_poses)):
                 out.rig_error_px = out.refined.rms_px
                 if self._source not in views:  # the camera that sees the most tags
                     self._source = max(views, key=lambda s: len(views[s].markers))
@@ -204,6 +210,18 @@ class ProbeTracker:
         out.measured = measured
         out.estimate = self.filter.update(measured, timestamp)
         self._last = out.estimate or measured
+        return out
+
+    def _own_depth_poses(self, views: dict[str, CameraView], poses: dict[str, ObjectPose]) -> dict[str, ObjectPose]:
+        """Each camera's pose refined with only its own tags and depth (when it has usable depth)."""
+        out = {}
+        for s, v in views.items():
+            out[s] = poses[s]
+            if not self.cfg.use_depth or v.depth is None:
+                continue
+            r = refine_multiview([v], self.geometry, poses[s], use_depth=True)
+            if r is not None and r.depth_samples and r.depth_rms_mm <= self.cfg.max_depth_error_mm:
+                out[s] = r.pose
         return out
 
     @staticmethod

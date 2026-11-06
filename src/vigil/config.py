@@ -91,6 +91,15 @@ class ProbeConfig(_Strict):
     max_depth_error_mm: float = 15.0  # depth that disagrees with the tags more is ignored
 
 
+class WorldTagsConfig(_Strict):
+    """ArUco tags fixed in the scene; CALIBRATE RIG uses them when testing.probe = 0."""
+    dictionary: str = "DICT_6X6_50"
+    marker_length_m: float = 0.04  # printed black square, excluding the white margin
+    ids: list[int] | None = None  # None = every tag except the probe cube's
+    min_views: int = 10  # frames a camera must see a tag in before it counts
+    use_depth: bool = True  # tag distance from measured depth (PnP alone is biased 1-4 cm)
+
+
 class ClariusConfig(_Strict):
     enabled: bool = True
     sdk_path: Path = Path("third_party/solum/libsolum.so")
@@ -135,6 +144,7 @@ class ServerConfig(_Strict):
 
 class TestConfig(_Strict):
     mode: int = 0
+    probe: int = 1  # 1 = CALIBRATE RIG with the probe cube, 0 = with the fixed world_tags
 
 
 class Config(_Strict):
@@ -143,6 +153,7 @@ class Config(_Strict):
     detector: DetectorConfig = DetectorConfig()
     estimator: EstimatorConfig = EstimatorConfig()
     probe: ProbeConfig = ProbeConfig()
+    world_tags: WorldTagsConfig = WorldTagsConfig()
     clarius: ClariusConfig = ClariusConfig()
     smoothing: SmoothingConfig = SmoothingConfig()
     scene: SceneConfig = SceneConfig()

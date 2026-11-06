@@ -163,6 +163,10 @@ class CameraClient:
             raise RuntimeError(info["error"])
         self.name, self.usb, self.mode = info["name"], info["usb"], tuple(info["mode"])
         self.depth_scale = info["depth_scale"]
+        if not hasattr(self, "depth_correction"):
+            # Multiplies this camera's depth (set by the rig from configs/extrinsics.yaml): a
+            # RealSense whose depth calibration drifted reads a few percent short or long.
+            self.depth_correction = 1.0
         self.state = info["state"]
         self.generation = info["generation"]
         k = info["intrinsics"]
@@ -182,7 +186,7 @@ class CameraClient:
 
     def nearest(self, ts: float) -> Frame | None:
         """The buffered frame captured closest to `ts` (for pairing with another camera)."""
-        return self.buffer.read(self.depth_scale, near_ts=ts)
+        return self.buffer.read(self.depth_scale * self.depth_correction, near_ts=ts)
 
     def paired(self, ts: float) -> Frame | None:
         """Frame to pair with another camera's frame captured at `ts`.
@@ -204,7 +208,7 @@ class CameraClient:
         deadline = time.monotonic() + timeout
         while True:
             if self.buffer.latest_index() > after_index:
-                f = self.buffer.read(self.depth_scale)
+                f = self.buffer.read(self.depth_scale * self.depth_correction)
                 if f is not None and f.index > after_index:
                     return f
             if time.monotonic() >= deadline:

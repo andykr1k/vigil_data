@@ -7,6 +7,8 @@
         frame00600_t0021.88s_tsdf_20261002-143012.ply   the mesh (world frame, metres)
         frame00600_t0021.88s_tsdf_20261002-143012.json  recording, frame, seq, time, window, settings, stats
         frame00600_t0021.88s_tsdf_20261002-143012.jpg   camera 1 at that frame (thumbnail)
+        frame00600_t0021.88s_tsdf_20261002-143012.npz   per camera, what each pipeline stage kept
+                                                (label maps for the pipeline page; tsdf.STAGE_LABELS)
         frame00600_t0021.88s_flat-scaf_20261008-101500-123456.{ply,json,jpg,npz}
                                                 FLATTEN MESH: that surface unrolled (SCAF / SLIM / ARAP);
                                                 the .npz maps every flat point back onto it
@@ -49,6 +51,9 @@ share a name:
   ....json                                      recording, frame, seq, time, fused time window,
                                                 every setting used, and build stats
   ....jpg                                       camera 1's colour image at that frame
+  ....npz                                       per camera, one label map (uint8, image-sized):
+                                                which pipeline stage removed each pixel of the leg
+                                                region, or 6 = fused (labels listed in the .json)
 
 frameNNNNN is the frame number the viewer shows (1-based); tSSSS.SSs is the time into the
 recording. In the viewer, SAVED MESHES opens a mesh together with its recording at that frame.
@@ -121,6 +126,14 @@ class MeshLibrary:
             "frame_files": [f.get("color") or f.get("ultrasound") for f in line["files"]],
             "stats": {k: v for k, v in mesh.stats.items() if k != "recording"},
         }
+        cams = (mesh.stages or {}).get("cameras") or {}
+        if cams:  # what each stage kept, for the pipeline page
+            with open(folder / f"{stem}.npz", "wb") as f:
+                np.savez_compressed(f, **{f"label_cam{cam}": c["label"] for cam, c in cams.items()})
+            entry["files"]["stages"] = f"{stem}.npz"
+            entry["stages"] = {"labels": {str(k): v for k, v in mesh.stages["labels"].items()},
+                               "cameras": {str(cam): {k: v for k, v in c.items() if k != "label"}
+                                           for cam, c in cams.items()}}
         (folder / f"{stem}.ply").write_bytes(mesh.to_ply())
         (folder / f"{stem}.json").write_text(json.dumps(entry, indent=2))
         self._write_index()
@@ -188,6 +201,15 @@ class MeshLibrary:
                           "stretch_p95": (s.get("distortion") or {}).get("stretch_p95")})
         out.sort(key=lambda e: (e["recording"], e["index"], e["created"]))
         return out
+
+    def stage_label(self, recording: str, stem: str, cam: int) -> np.ndarray | None:
+        """A surface mesh's stage map for one camera (None for meshes saved before these existed)."""
+        entry = json.loads(self.path(recording, stem, "json").read_text())
+        if entry.get("method") == "flat" or not entry.get("files", {}).get("stages"):
+            return None
+        with np.load(self.path(recording, stem, "npz"), allow_pickle=False) as data:
+            key = f"label_cam{int(cam)}"
+            return data[key] if key in data.files else None
 
     def load(self, recording: str, stem: str) -> tuple[Mesh, dict]:
         ply = self.path(recording, stem, "ply")

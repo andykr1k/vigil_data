@@ -480,6 +480,7 @@ html, body {
   color: var(--cyan); background: none; border: 1px solid rgba(34, 228, 255, 0.3);
 }
 .saved-item .acts button.del { color: var(--err); border-color: rgba(255, 77, 106, 0.4); }
+.saved-item .acts button.steps { color: var(--ok); border-color: rgba(61, 255, 168, 0.4); }
 #rp-switch-row { margin-bottom: 8px; }
 
 /* ───────────── flatten mesh ───────────── */

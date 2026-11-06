@@ -767,7 +767,7 @@ function updateHud(frame) {
     const pct = others.length ? Math.min(...others) / target : 0;
     $("cal-progress").hidden = false;
     $("cal-progress").firstElementChild.style.width = `${Math.round(pct * 100)}%`;
-    rigMsg(`Collecting still views… ${rigCams.slice(1).map((rc) => `CAM ${rc.info.index + 1}: ${progress[rc.info.serial] ?? 0}/${target}`).join(" · ")}`);
+    rigMsg(`${hello?.rig_source === "tags" ? "Watching the world tags…" : "Collecting still views…"} ${rigCams.slice(1).map((rc) => `CAM ${rc.info.index + 1}: ${progress[rc.info.serial] ?? 0}/${target}`).join(" · ")}`);
   }
 }
 
@@ -892,11 +892,15 @@ function renderRigList() {
   }
   $("rig-meta").textContent = `${rigCams.length} CAM${rigCams.length === 1 ? "" : "S"}`;
   const calBtn = $("rig-calibrate");
-  calBtn.disabled = rigCams.length < 2 || !probeState.info;
-  calBtn.title = rigCams.length < 2 ? "Connect a second camera to calibrate the rig" : "";
+  const byTags = hello?.rig_source === "tags"; // testing.probe = 0: fixed tags in the scene
+  calBtn.disabled = rigCams.length < 2 || (!byTags && !probeState.info);
+  calBtn.title = rigCams.length < 2 ? "Connect a second camera to calibrate the rig"
+    : byTags ? "Place the cameras using the fixed world tags (testing.probe = 0)"
+    : "Place the cameras using the probe cube (testing.probe = 1)";
   if (rigCams.length < 2) rigMsg("Single camera — connect another RealSense to fuse views.");
   else if (rigCams.slice(1).some((rc) => !rc.info.T_world_camera))
-    rigMsg("Hold the probe where every camera sees its tags, then press CALIBRATE RIG.");
+    rigMsg(byTags ? "Make sure every camera sees 3+ of the world tags, then press CALIBRATE RIG."
+      : "Hold the probe where every camera sees its tags, then press CALIBRATE RIG.");
 }
 
 function updateRigHealth(frame) {
@@ -2028,7 +2032,8 @@ function renderLibrary() {
       : `Open ${e.recording} at frame ${e.frame} and show this mesh`;
     const img = e.thumbnail ? `<img loading="lazy" alt="" src="${meshUrl(e, "jpg")}">` : `<span class="noimg"></span>`;
     li.innerHTML = `${img}<div class="t"><b></b><span></span><span></span></div>` +
-      `<div class="acts"><button class="ply" title="Download PLY">PLY</button><button class="del" title="Delete these files">DEL</button></div>`;
+      `<div class="acts"><button class="steps" title="Open a page with the result of every pipeline stage">STEPS</button>` +
+      `<button class="ply" title="Download PLY">PLY</button><button class="del" title="Delete these files">DEL</button></div>`;
     li.querySelector(".t b").textContent = `FRAME ${e.frame} · ${mmss(e.time_s)}`;
     if (isFlat) {
       const tag = document.createElement("span");
@@ -2041,6 +2046,11 @@ function renderLibrary() {
       (isFlat ? ` · stretch p95 ${(e.stretch_p95 ?? 0).toFixed(2)}` : e.window ? ` · ±${e.window.seconds}s` : "");
     spans[1].textContent = `saved ${e.created.replace("T", " ")}`;
     li.onclick = () => openSaved(e);
+    li.querySelector(".steps").onclick = (ev) => { // a flat mesh's pipeline is its source's
+      ev.stopPropagation();
+      const k = isFlat && e.source ? e.source : e;
+      window.open(`pipeline.html?recording=${encodeURIComponent(k.recording)}&stem=${encodeURIComponent(k.stem)}`, "_blank");
+    };
     li.querySelector(".ply").onclick = (ev) => {
       ev.stopPropagation();
       const a = document.createElement("a"); a.href = meshUrl(e, "ply"); a.download = "";

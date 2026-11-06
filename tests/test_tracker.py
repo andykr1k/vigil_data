@@ -105,3 +105,48 @@ def test_stale_rig_calibration_tracks_from_one_camera():
     # Sticky: the next frame uses the same camera.
     tracker.track(inputs, timestamp=1.033)
     assert tracker._source == source
+
+
+def render_depth(tracker, T_img_obj, size=(848, 480)):
+    """Depth (z, metres) of the cube's camera-facing faces; 0 elsewhere."""
+    g = tracker.geometry
+    depth = np.zeros((size[1], size[0]), np.float32)
+    u, v = np.meshgrid(np.arange(size[0], dtype=np.float64), np.arange(size[1], dtype=np.float64))
+    rays = np.stack([(u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1], np.ones_like(u)], -1)
+    h = np.asarray(g.cube_size) / 2
+    for m in g.mounts.values():
+        R = T_img_obj[:3, :3]
+        centre = R @ np.asarray(m.center) + T_img_obj[:3, 3]
+        normal = R @ m.rotation_object_from_marker[:, 2]
+        if normal @ centre >= -1e-3:
+            continue
+        z = (normal @ centre) / (rays @ normal)
+        P = rays * z[..., None]
+        local = (P - T_img_obj[:3, 3]) @ R  # back into the cube frame
+        inside = np.all(np.abs(local) <= h + 1e-4, axis=-1) & (z > 0)
+        depth = np.where(inside & ((depth == 0) | (z < depth)), z, depth)
+    return depth.astype(np.float32)
+
+
+def test_cameras_facing_each_other_agree_once_each_uses_its_depth():
+    """A good calibration must not be flagged: each camera's tag-only pose is weak along its own
+    ray, and opposite cameras err in opposite directions; with its own depth each one is solid."""
+    tracker = ProbeTracker(Config())
+    tracker.set_method("raw")
+    T_world_obj = to_h(rot([0.3, 0.6, 0.2]), np.array([0.0, 0.05, 1.0]))
+    T_w_c2 = to_h(rot([0.0, np.pi + 0.5, 0.0]), np.array([0.5, 0.0, 1.9]))  # facing camera 1
+    inputs = []
+    for serial, T in (("cam1", np.eye(4)), ("cam2", T_w_c2)):
+        T_io = np.linalg.inv(T) @ T_world_obj
+        inputs.append(ProbeInput(serial, T, K, D, cv2.cvtColor(render(tracker, T_io), cv2.COLOR_GRAY2RGB),
+                                 render_depth(tracker, T_io)))
+    frame = tracker.track(inputs, timestamp=1.0)
+    assert set(frame.compare_poses) == {"cam1", "cam2"}
+    for pose in frame.compare_poses.values():
+        assert err(pose, T_world_obj)[0] < 6
+    assert frame.rig_error_px is None  # both cameras used
+
+    stale = to_h(T_w_c2[:3, :3], T_w_c2[:3, 3] + [0.025, 0.0, 0.0])  # camera 2 moved 2.5 cm
+    inputs[1] = ProbeInput("cam2", stale, K, D, inputs[1].image, inputs[1].depth)
+    moved = ProbeTracker(Config())
+    assert moved.track(inputs, timestamp=1.0).rig_error_px is not None  # still caught

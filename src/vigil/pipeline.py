@@ -267,6 +267,7 @@ class Pipeline:
             "bones": BONES,
             "has_mesh": self.faces is not None,
             "probe": probe,
+            "rig_source": "probe" if self.cfg.testing.probe else "tags",  # what CALIBRATE RIG uses
             "depth_limits": [self.cfg.cameras.depth_min_m, self.cfg.cameras.depth_max_m],
             "clarius": {"model": self.cfg.clarius.model, "application": self.application}
             if self.cfg.clarius.enabled else None,
@@ -343,20 +344,23 @@ class Pipeline:
             body_seq_sent = state.seq
 
             t0 = time.perf_counter()
-            probe = None
+            probe = pf = None
             if tracker is not None:
                 pf = self._track_probe(rig, frames, fresh, tracker, f0.timestamp)
                 probe = self._probe_json(pf, rig, frames, views, tracker,
                                          body.joints_at(f0.timestamp))
-                self._health.add(rig.world.serial, pf.world_poses, f0.timestamp)
-                if calibrator is not None:
-                    try:
+                self._health.add(rig.world.serial, pf.compare_poses or pf.world_poses, f0.timestamp)
+            if calibrator is not None:
+                try:
+                    if calibrator.source == "tags":
+                        calibrator.add(self._tag_inputs(rig, frames, fresh))
+                    elif pf is not None:
                         calibrator.add(rig.world.serial, pf.cam_poses)
-                        calibrator = self._check_calibration(rig, calibrator, backend, tracker)
-                    except Exception as e:  # a failed calibration must not stop streaming
-                        log.error("rig calibration failed:\n%s", traceback.format_exc())
-                        self._calibration_result("failed", f"Calibration error: {type(e).__name__}: {e}")
-                        calibrator = None
+                    calibrator = self._check_calibration(rig, calibrator, backend, tracker)
+                except Exception as e:  # a failed calibration must not stop streaming
+                    log.error("rig calibration failed:\n%s", traceback.format_exc())
+                    self._calibration_result("failed", f"Calibration error: {type(e).__name__}: {e}")
+                    calibrator = self._close_calibrator(calibrator)
             probe_ms = (time.perf_counter() - t0) * 1000
 
             for rc in rig.cameras:
@@ -516,9 +520,10 @@ class Pipeline:
                 elif cmd == "replay_stop":
                     self._replay(None)
                 elif cmd == "calibrate_rig":
+                    self._close_calibrator(calibrator)
                     calibrator = self._start_calibration(rig, tracker)
                 elif cmd == "cancel_calibration" and calibrator is not None:
-                    calibrator = None
+                    calibrator = self._close_calibrator(calibrator)
                     self._calibration_result("cancelled", "Calibration cancelled.")
             except (ValueError, TypeError, KeyError, OSError) as e:  # a bad message must not stop the loop
                 log.warning("bad command %s: %s", msg, e)
@@ -696,18 +701,28 @@ class Pipeline:
             self.hello = self._live_hello
             self.publish(self.hello, [])
 
-    def _start_calibration(self, rig: Rig, tracker) -> RigCalibrator | None:
-        if tracker is None:
-            self._calibration_result("failed", "Probe tracking is disabled (probe.enabled).")
-            return None
+    def _start_calibration(self, rig: Rig, tracker):
         if len(rig.cameras) < 2:
             self._calibration_result("failed", "Only one camera connected — nothing to calibrate.")
+            return None
+        if self.cfg.testing.probe == 0:  # fixed tags in the scene instead of the probe cube
+            from .probe.geometry import ProbeGeometry
+            from .world_tags import TagRigCalibrator
+
+            pc = self.cfg.probe
+            cube = ProbeGeometry.clarius(pc.marker_length_m, pc.cube_size_m, pc.tip_in_object_m)
+            self._calibration_result("collecting", "Watching the world tags: keep them still and "
+                                     "in view of every camera.")
+            return TagRigCalibrator(self.cfg.world_tags, rig.world.serial,
+                                    self.cfg.probe.calibration_samples, set(cube.mounts))
+        if tracker is None:
+            self._calibration_result("failed", "Probe tracking is disabled (probe.enabled).")
             return None
         self._calibration_result("collecting", "Hold the probe still where every camera sees "
                                  "its tags; move it to a new spot every few seconds.")
         return RigCalibrator(self.cfg.probe.calibration_samples)
 
-    def _check_calibration(self, rig: Rig, cal: RigCalibrator, backend: str, tracker):
+    def _check_calibration(self, rig: Rig, cal, backend: str, tracker):
         others = [rc.serial for rc in rig.cameras[1:]]
         if not cal.finished(others):
             return cal
@@ -719,15 +734,38 @@ class Pipeline:
                 continue
             T, meta = res
             rig.set_extrinsic(serial, T, meta)
-            solved.append(f"{serial}: {meta['samples']} samples, ±{meta['stderr_mm']} mm / "
-                          f"±{meta['stderr_deg']}° (frame scatter {meta['spread_mm']} mm)")
+            solved.append(cal.summary(serial, meta))
         if solved:
             self._send_hello(rig, backend, tracker)
         text = "; ".join(solved)
         if failed:
-            text += ("; " if text else "") + ("not enough steady views for " + ", ".join(failed))
+            if cal.source == "tags":
+                seen = cal.tags_seen()
+                why = ", ".join(f"CAM {rc.index + 1} sees {seen.get(rc.serial) or 'no tags'}"
+                                for rc in rig.cameras)
+                text += ("; " if text else "") + f"no tag seen by both {', '.join(failed)} and CAM 1 ({why})"
+            else:
+                text += ("; " if text else "") + ("not enough steady views for " + ", ".join(failed))
         self._calibration_result("done" if solved else "failed", text)
+        return self._close_calibrator(cal)
+
+    @staticmethod
+    def _close_calibrator(cal) -> None:
+        if cal is not None and hasattr(cal, "close"):
+            cal.close()
         return None
+
+    def _tag_inputs(self, rig: Rig, frames, fresh) -> list:
+        from .world_tags import TagInput
+
+        out = []
+        for rc in rig.cameras:
+            if not fresh[rc.index]:
+                continue
+            f, K = frames[rc.index], rc.camera.intrinsics
+            out.append(TagInput(rc.serial, K.matrix().astype(np.float64), K.dist_coeffs(),
+                                f.color, f.depth))
+        return out
 
     def _calibration_result(self, state: str, message: str) -> None:
         log.info("rig calibration %s: %s", state, message)

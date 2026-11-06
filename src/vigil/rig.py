@@ -56,6 +56,7 @@ class RigCamera:
             "width": K.width, "height": K.height,
             "fx": K.fx, "fy": K.fy, "cx": K.cx, "cy": K.cy,
             "fps": self.camera.mode[2],
+            "depth_correction": getattr(self.camera, "depth_correction", 1.0),
             "state": self.camera.state,
             "T_world_camera": None if self.T_world_camera is None
             else [float(v) for v in self.T_world_camera.reshape(-1)],
@@ -108,6 +109,9 @@ class Rig:
 
     def _apply(self) -> None:
         T_ref_world = self._ref_T.get(self.world.serial)
+        for rc in self.cameras:  # depth scale fixes found by tag calibration (1 = none)
+            if getattr(rc, "camera", None) is not None:
+                rc.camera.depth_correction = float(self._meta.get(rc.serial, {}).get("depth_correction", 1.0))
         for rc in self.cameras[1:]:
             T_ref_cam = self._ref_T.get(rc.serial)
             rc.T_world_camera = (None if T_ref_world is None or T_ref_cam is None
@@ -121,6 +125,15 @@ class Rig:
             self._ref_T[serial] = self._ref_T[w] @ T_world_camera
         else:
             self._ref, self._ref_T, self._meta = w, {w: np.eye(4), serial: T_world_camera}, {}
+        meta = dict(meta)
+        if "depth_correction" in meta:
+            # Measured on depth that was already corrected: compose with what's applied now.
+            cam = next((getattr(rc, "camera", None) for rc in self.cameras if rc.serial == serial), None)
+            applied = getattr(cam, "depth_correction", 1.0)
+            meta["depth_correction_measured"] = meta["depth_correction"]
+            meta["depth_correction"] = round(float(applied * meta["depth_correction"]), 4)
+        elif serial in self._meta and "depth_correction" in self._meta[serial]:
+            meta["depth_correction"] = self._meta[serial]["depth_correction"]  # a probe recalibration keeps it
         self._meta[serial] = {k: v.item() if isinstance(v, np.generic) else v for k, v in meta.items()}
         self._apply()
         self._save()
@@ -135,7 +148,7 @@ class Rig:
             },
         }
         self.extrinsics_path.parent.mkdir(parents=True, exist_ok=True)
-        header = ("# Camera extrinsics, written by CALIBRATE RIG (probe cube seen by both cameras).\n"
+        header = ("# Camera extrinsics, written by CALIBRATE RIG (probe cube or fixed world tags).\n"
                   "# T_reference_camera maps camera optical-frame points into the reference camera.\n")
         self.extrinsics_path.write_text(header + yaml.safe_dump(doc, sort_keys=False))
 
@@ -154,6 +167,7 @@ class RigCalibrator:
 
     target: int
     timeout_s: float = 60.0
+    source = "probe"
     started: float = field(default_factory=time.monotonic)
     samples: dict[str, list[np.ndarray]] = field(default_factory=dict)
     _recent: deque = field(default_factory=lambda: deque(maxlen=5))
@@ -183,6 +197,11 @@ class RigCalibrator:
 
     def progress(self) -> dict[str, int]:
         return {s: len(v) for s, v in self.samples.items()}
+
+    @staticmethod
+    def summary(serial: str, meta: dict) -> str:
+        return (f"{serial}: {meta['samples']} samples, ±{meta['stderr_mm']} mm / "
+                f"±{meta['stderr_deg']}° (frame scatter {meta['spread_mm']} mm)")
 
     def finished(self, serials: list[str]) -> bool:
         timed_out = time.monotonic() - self.started > self.timeout_s
@@ -217,6 +236,7 @@ class RigCalibrator:
             "spread_deg": round(rot_spread, 3),
             "stderr_mm": round(float(spread_mm / np.sqrt(n)), 2),
             "stderr_deg": round(float(rot_spread / np.sqrt(n)), 3),
+            "source": "probe",
             "calibrated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         return to_h(R_mean, t_mean), meta
