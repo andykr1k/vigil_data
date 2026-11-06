@@ -417,6 +417,15 @@ html, body {
 .mesh-methods { grid-template-columns: 1fr; margin-top: 0; }
 .seg-row.two { grid-template-columns: 1fr 1fr; }
 .seg-row.three { grid-template-columns: repeat(3, 1fr); margin-top: 6px; }
+.seg-row.five { grid-template-columns: repeat(5, 1fr); margin-top: 6px; }
+.auto-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
+#sam-tools[hidden], #scan-tools[hidden] { display: none; }
+#sam-kind button[data-kind="leg"].on { background: #3dffa8; }
+#sam-kind button[data-kind="not"].on { background: #ff3d6e; }
+#sam-kind button[data-kind="knee"].on { background: #ffd23d; }
+#sam-kind button[data-kind="hip"].on { background: #3db4ff; }
+#sam-kind button[data-kind="box"].on { background: #ff9f1c; }
+.feeds.sam-pick canvas { cursor: crosshair; }
 .mesh-hint { margin: 8px 0 0; color: var(--dim); font-size: 10px; line-height: 1.45; }
 .mesh-ctl { display: grid; gap: 7px; margin-top: 8px; }
 .mesh-ctl label { display: grid; grid-template-columns: 58px 1fr 62px; align-items: center; gap: 8px;

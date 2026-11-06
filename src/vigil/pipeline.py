@@ -15,6 +15,8 @@ import struct
 import threading
 import time
 import traceback
+from copy import deepcopy
+from dataclasses import asdict
 from typing import Callable
 
 import cv2
@@ -63,6 +65,9 @@ class Pipeline:
         self._chosen = threading.Event()
         self._us_seq = -1
         self.recorder = None  # recorder.Recorder while recording
+        self.scan: dict | None = None  # SCAN THIGH while its recording runs: {"until", "seconds", "leg"}
+        self._scan_busy = False  # includes reconstruction and unfolding after capture ends
+        self.scan_status: dict | None = None
         self.player = None  # replay.Player while replaying (live frames aren't sent)
         self._live_hello: dict | None = None
         # Display depth window (m) set from the dashboard; clouds, and optionally feeds,
@@ -418,6 +423,8 @@ class Pipeline:
             if self.recorder is not None:
                 self.recorder.add_frame(seq, frames, fresh, {"t": f0.timestamp, "frame": msg}, us_new)
                 msg = dict(msg, recording=self.recorder.status())
+            if self.scan is not None and time.monotonic() >= self.scan["until"]:
+                self._finish_scan()
             if self.player is None:  # while replaying, the dashboard shows the recording
                 self.publish(msg, binaries)
 
@@ -498,6 +505,8 @@ class Pipeline:
                     self._set_depth_range(msg)
                 elif cmd == "record":
                     self._record(rig, bool(msg.get("on")))
+                elif cmd == "scan":
+                    self._scan(rig, msg)
                 elif cmd == "recordings":
                     self._list_recordings()
                 elif cmd == "replay":
@@ -527,6 +536,10 @@ class Pipeline:
                  "depth_window": list(self.depth_range), "hello": self._live_hello})
             self._recording_msg("recording", f"Recording to {self.recorder.path}")
         elif not on and self.recorder is not None:
+            if self.scan is not None:
+                self.scan = None
+                self._scan_busy = False
+                self._scan_msg("cancelled", "Scan cancelled; the captured frames will be saved.")
             rec, self.recorder = self.recorder, None
 
             def finish():  # flushing queued writes can take a moment: off the loop
@@ -536,6 +549,119 @@ class Pipeline:
                 self._list_recordings()
 
             threading.Thread(target=finish, name="rec-close", daemon=True).start()
+
+    # ------------------------------------------------------------------ scan (SCAN THIGH)
+    def _scan(self, rig: Rig, msg: dict) -> None:
+        """Capture in the live loop, then reconstruct and unfold off the loop."""
+        from .meshing.flatten import METHODS
+        from .meshing.tsdf import TsdfParams
+
+        if self._scan_busy:
+            return
+        if self.cfg.testing.mode == 1:
+            self._scan_msg("error", "Live scanning requires testing.mode = 0.")
+            return
+        if self.player is not None or self.recorder is not None:
+            self._scan_msg("error", "Scanning records live: stop the replay or the recording first.")
+            return
+        try:
+            seconds = float(np.clip(float(msg.get("seconds", 2.0)), 0.5, 10.0))
+            params = asdict(TsdfParams.from_dict(deepcopy(msg.get("params") or {})))
+            unfolding = msg.get("unfold") or {}
+            method = unfolding.get("method", "scaf")
+            iterations = int(unfolding.get("iterations", 50))
+            if (not np.isfinite(seconds) or not np.isfinite(params["window_s"])
+                    or method not in METHODS or not 1 <= iterations <= 1000):
+                raise ValueError("Invalid scan duration, window, unfolding method or iterations.")
+        except (AttributeError, TypeError, ValueError, OverflowError) as e:
+            self._scan_msg("error", f"Invalid scan settings: {e}")
+            return
+        self._record(rig, True)
+        if self.recorder is None:
+            self._scan_msg("error", "Couldn't start recording the scan.")
+            return
+        leg = msg.get("leg") if msg.get("leg") in ("left", "right") else "auto"
+        self._scan_busy = True
+        self.scan = {"until": time.monotonic() + seconds, "seconds": seconds, "leg": leg,
+                     "params": params, "method": method, "iterations": iterations,
+                     "cameras": deepcopy((self._live_hello or {}).get("cameras", []))}
+        self._scan_msg("capturing", f"Hold the leg still: capturing {seconds:.1f} s while live…", seconds=seconds)
+
+    def _finish_scan(self) -> None:
+        """Save the capture, run the existing AUTO pipeline, then the existing unfolding.
+
+        Only orchestration lives here: the camera loop keeps publishing live frames.
+        """
+        scan, self.scan = self.scan, None
+        rec, self.recorder = self.recorder, None
+        if rec is None:
+            self._scan_busy = False
+            return
+
+        def run():
+            from .meshing import routes
+            from .meshing.auto import run_recording
+            from .meshing.flatten import flatten_mesh
+            from .meshing.library import MeshLibrary
+            from .meshing.tsdf import MeshError
+
+            context = {"recording": rec.path.name, "cameras": scan["cameras"]}
+            locked, stem = False, None
+            try:
+                s = rec.close()
+                self._recording_msg("saved", f"Saved the {s['seconds']:.1f} s scan, {s['frames']} frames "
+                                    f"({s['dropped']} dropped) to {s['path']}")
+                self._list_recordings()
+                self._scan_msg("meshing", "Finding the leg, knee and hip, then meshing the thigh…", **context)
+                meshes = self.cfg.resolve(self.cfg.recording.dir).parent / "Meshes"
+                library = MeshLibrary(meshes)
+                window = min(scan["params"]["window_s"], max(0.1, scan["seconds"] / 2 - 0.05))
+                locked = routes._building.acquire(timeout=600)
+                if not locked:
+                    raise MeshError("Another mesh build is still running; the scan is saved.")
+                report = run_recording(rec.path, library, side=scan["leg"], count=1, attempts=3,
+                                       window_s=window, stride_s=0.25, params=scan["params"])
+                if not report["accepted"]:
+                    why = "; ".join(f"frame {a['frame']}: {a.get('reason', '')}" for a in report["attempts"]) \
+                        or report.get("note", "No frame showed the leg well enough to try.")
+                    raise MeshError(f"No mesh from this scan ({why}). The capture is saved; try scanning again.")
+                stem = report["accepted"][0]
+                context["stem"] = stem
+                self.publish({"type": "meshes_changed", "recording": rec.path.name}, [])
+                self._scan_msg("unfolding", "Thigh mesh saved; unfolding while the live view continues…", **context)
+                mesh, source = library.load(rec.path.name, stem)
+                last_progress = 0.0
+
+                def progress(stage, fraction):
+                    nonlocal last_progress
+                    now = time.monotonic()
+                    if fraction >= 1 or now - last_progress >= 0.2:
+                        last_progress = now
+                        self._scan_msg("unfolding", f"Unfolding: {stage}…", progress=fraction, **context)
+
+                result = flatten_mesh(mesh, scan["method"], scan["iterations"], progress)
+                flat_entry = library.save_flat(result, source)
+                self._scan_msg("done", "Thigh mesh and unfolding saved. Live overlay is fixed at the captured position.",
+                               flat_stem=flat_entry["stem"], warnings=result.flat.stats.get("warnings", []), **context)
+            except Exception as e:  # noqa: BLE001: show it in the dashboard rather than lose the thread
+                log.exception("scan processing failed")
+                if stem is not None:
+                    self._scan_msg("partial", f"3D mesh saved; unfolding failed: {e}. Retry with FLATTEN.", **context)
+                else:
+                    self._scan_msg("failed", str(e), **context)
+            finally:
+                if locked:
+                    routes._building.release()
+                self._scan_busy = False
+                if stem is not None:
+                    self.publish({"type": "meshes_changed", "recording": rec.path.name}, [])
+
+        threading.Thread(target=run, name="scan-mesh", daemon=True).start()
+
+    def _scan_msg(self, state: str, message: str, **extra) -> None:
+        log.info("[scan] %s", message)
+        self.scan_status = {"type": "scan", "state": state, "message": message, **extra}
+        self.publish(self.scan_status, [])
 
     def _recording_msg(self, state: str, message: str) -> None:
         log.info("[recording] %s", message)

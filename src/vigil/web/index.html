@@ -23,7 +23,7 @@
   <div class="vignette"></div>
 
   <!-- ───────────── startup: pick a procedure, then watch it load ───────────── -->
-  <div id="boot" hidden>
+  <div id="boot">
     <div class="boot-card">
       <div class="brand">
         <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
@@ -33,7 +33,7 @@
         </svg>
         <h1>VIGIL</h1>
       </div>
-      <p class="boot-sub" id="boot-sub">SELECT PROCEDURE</p>
+      <p class="boot-sub" id="boot-sub">LOADING DASHBOARD…</p>
       <div class="boot-choices" id="boot-choices"></div>
       <div id="boot-progress" hidden>
         <div class="boot-bar"><i id="boot-bar"></i></div>
@@ -243,9 +243,32 @@
         <div class="mesh-cams" id="mesh-cams"></div>
 
         <h3 class="sub">LEG REGION</h3>
-        <div class="seg-row two" id="mesh-region">
+        <div class="seg-row three" id="mesh-region">
           <button data-region="pose" class="on" title="Upper half-capsule around the detected leg bones">POSE CAPSULE</button>
           <button data-region="window" title="Everything inside the depth window">DEPTH WINDOW</button>
+          <button data-region="sam" title="The thigh, knee → hip: found by AUTO (Sapiens2), clicks or a BOX, and tracked by SAM 2">SAM 2 THIGH</button>
+        </div>
+        <div id="sam-tools" hidden>
+          <p class="mesh-hint">AUTO finds the leg, knee and hip on this frame (Sapiens2), or click them in a camera feed: the thigh
+            (+ LEG), the knee (KNEE) and optionally the hip (HIP). Or pick BOX and drag a box around the thigh: the mesh keeps only
+            what's inside it. SAM 2 tracks the leg through the frames; the mesh is cut at the knee (and the hip). With no clicks,
+            BUILD MESH runs AUTO itself.</p>
+          <div class="auto-row">
+            <button id="sam-auto" title="Find the leg, knee and hip on this frame with Sapiens2 (body parts on a bare leg, keypoints otherwise). The prompts appear as clicks you can correct.">AUTO</button>
+            <select id="sam-auto-leg" title="Which of the subject's legs AUTO (and SCAN THIGH) meshes">
+              <option value="auto">EITHER LEG</option><option value="left">LEFT LEG</option><option value="right">RIGHT LEG</option>
+            </select>
+          </div>
+          <div class="seg-row five" id="sam-kind" title="What a click on a camera feed adds">
+            <button data-kind="leg" class="on" title="This is the leg">+ LEG</button><button data-kind="not" title="This is not the leg (the other leg, a hand, the stool…)">− NOT</button><button data-kind="knee" title="Where to cut at the knee">KNEE</button><button data-kind="hip" title="Where the thigh ends at the hip (optional): a second cut there">HIP</button><button data-kind="box" title="Drag a box around the thigh in a camera feed: SAM 2 segments what's in it and the mesh keeps only what lies inside it (seen from that camera), in every camera. One per camera; works alone or with the clicks.">BOX</button>
+          </div>
+          <div class="seg-row two">
+            <button id="sam-undo" title="Remove the last click">UNDO</button><button id="sam-clear" title="Remove every click">CLEAR</button>
+          </div>
+          <p class="rig-msg" id="sam-msg"></p>
+          <div class="toggles mesh-toggles">
+            <label class="toggle" title="Keep only a tube around the thigh, measured just above the knee and widening toward the hip. SAM 2 keeps shorts or trousers whole (both thighs, the buttock); this drops what's off the thigh. Needs the knee cut."><span>Thigh tube</span><input type="checkbox" data-mp="tube" checked><i></i></label>
+          </div>
         </div>
         <div class="seg-row three" id="mesh-section" title="Which part of the leg to mesh. The knee is placed from the recorded knee detections that lie on the leg (median along the leg).">
           <button data-section="whole">WHOLE LEG</button><button data-section="above" class="on">ABOVE KNEE</button><button data-section="below">BELOW KNEE</button>
@@ -301,6 +324,23 @@
         <div class="cal-progress" id="mesh-progress" hidden><i></i></div>
         <p class="rig-msg" id="mesh-msg"></p>
 
+        <div id="scan-tools" hidden>
+          <h3 class="sub">LIVE SCAN</h3>
+          <p class="mesh-hint">Capture, reconstruct and unfold while the cameras stay live. Uses the mesh settings above
+            and the method/iterations in FLATTEN MESH; AUTO supplies the thigh mask and knee/hip cuts.
+            Hold the leg still until the mesh appears over it. The overlay stays at the captured position.
+            Capture and both meshes are saved; viewing the result does not start replay.</p>
+          <div class="mesh-ctl">
+            <label title="Capture duration. The selected fusion WINDOW is limited to fit inside this capture.">LENGTH
+              <input type="range" id="scan-seconds" min="0.5" max="10" step="0.5" value="2"><b><span>2.0</span> s</b></label>
+          </div>
+          <div class="btn-row two">
+            <button id="scan-run" title="Capture the thigh, reconstruct and unfold using the selected settings; stay live">SCAN + UNFOLD</button>
+            <button id="scan-view" disabled title="Show this scan's mesh over the live scene, without replay">VIEW LIVE MESH</button>
+          </div>
+          <p class="rig-msg" id="scan-msg"></p>
+        </div>
+
         <div id="mesh-result" hidden>
           <dl class="mesh-stats" id="mesh-stats"></dl>
           <div class="toggles mesh-toggles">
@@ -333,8 +373,9 @@
           <label class="flat-src" title="A saved surface mesh (BUILD MESH saves them)">MESH
             <select id="flat-source"></select></label>
         </div>
-        <div class="seg-row two" id="flat-method">
+        <div class="seg-row three" id="flat-method">
           <button data-method="scaf" class="on" title="SCAF · Jiang 2017: symmetric Dirichlet energy with a scaffold that keeps the boundary from overlapping (libigl)">SCAF</button>
+          <button data-method="slim" title="SLIM · Rabinovich 2017: symmetric Dirichlet energy, local/global with a line search that never flips a triangle (libigl)">SLIM</button>
           <button data-method="arap" title="ARAP · Liu 2008: as-rigid-as-possible, local/global (libigl)">ARAP</button>
         </div>
         <div class="mesh-ctl">
@@ -393,6 +434,6 @@
     </section>
   </aside>
 
-  <script type="module" src="app.js"></script>
+  <script src="bootstrap.js"></script>
 </body>
 </html>

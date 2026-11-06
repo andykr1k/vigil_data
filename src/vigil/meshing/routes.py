@@ -3,8 +3,9 @@
 A mesh is built from the recording being replayed (`pipeline.player`) at its current or a
 given frame, saved under Meshes/<recording>/ (library.py), and announced over the dashboard's
 websocket via `pipeline.publish` (build progress, "meshes changed"). FLATTEN MESH unrolls a
-saved mesh (flatten.py); it needs no replay. Prefix /api/surface:
-/api/mesh/* is the SAM 3D Body mesh.
+saved mesh (flatten.py); it needs no replay. LEG REGION = SAM 2: /leg-mask previews the clicked
+leg (legmask.py) and /auto-prompts places the clicks itself (autoleg.py), on the replayed frame.
+Prefix /api/surface: /api/mesh/* is the SAM 3D Body mesh.
 """
 
 from __future__ import annotations
@@ -69,6 +70,42 @@ def _build(pipeline, library: MeshLibrary, body: dict) -> dict:
     return {"recording": entry["recording"], "stem": entry["stem"], "entry": entry, "stats": mesh.stats}
 
 
+def _replayed(pipeline) -> tuple:
+    player = pipeline.player
+    if player is None:
+        raise MeshError("Replay a recording first: the leg is found on recorded frames.")
+    return player, json.loads((player.path / "meta.json").read_text())
+
+
+def _leg_mask(pipeline, body: dict) -> dict:
+    """SAM 2 preview: the clicked leg on the clicked frame, in every calibrated camera."""
+    from . import legmask
+
+    player, meta = _replayed(pipeline)
+    prompts = legmask.Prompts.parse(body, len(player.lines))
+    result = legmask.segment(player.path, meta, player.lines, prompts)
+    cameras = {}
+    for cam, r in result.items():
+        mask = r["masks"].get(r["line"])
+        cameras[cam] = {"source": r["source"], "points": r["points"],
+                        "pixels": 0 if mask is None else int(mask.sum()),
+                        "png": None if mask is None else legmask.overlay_png(mask)}
+    return {"index": prompts.index, "cameras": cameras}
+
+
+def _auto_prompts(pipeline, body: dict) -> dict:
+    """AUTO: the clicks for a frame (default: the replayed one), from Sapiens2."""
+    from . import autoleg
+    from .auto import _jsonable
+
+    player, meta = _replayed(pipeline)
+    index = int(body["index"]) if body.get("index") is not None else player.index
+    index = min(max(index, 0), len(player.lines) - 1)
+    info = autoleg.propose(player.path, meta, player.lines, index, body.get("side") or "auto",
+                           body.get("size") or autoleg.DEFAULT_SIZE)
+    return _jsonable({k: v for k, v in info.items() if k not in ("knee_s", "plane")})
+
+
 def _flatten(pipeline, library: MeshLibrary, body: dict) -> dict:
     try:
         mesh, source = library.load(str(body.get("recording", "")), str(body.get("stem", "")))
@@ -112,9 +149,21 @@ async def build(request: Request, body: dict) -> Response:
     return await _run(_build, request.app.state.pipeline, MeshLibrary(meshes_root(request)), body)
 
 
+@router.post("/leg-mask")
+async def leg_mask(request: Request, body: dict) -> Response:
+    """Body: index (replay frame), clicks [{cam, x, y, kind: leg | not | knee | hip | box (+ x2, y2)}]."""
+    return await _run(_leg_mask, request.app.state.pipeline, body)
+
+
+@router.post("/auto-prompts")
+async def auto_prompts(request: Request, body: dict) -> Response:
+    """Body: index (replay frame; default the current one), side (auto | left | right)."""
+    return await _run(_auto_prompts, request.app.state.pipeline, body)
+
+
 @router.post("/flatten")
 async def flatten(request: Request, body: dict) -> Response:
-    """Body: recording, stem (a saved surface mesh), method ("scaf" | "arap"), iterations."""
+    """Body: recording, stem (a saved surface mesh), method ("scaf" | "slim" | "arap"), iterations."""
     return await _run(_flatten, request.app.state.pipeline, MeshLibrary(meshes_root(request)), body)
 
 

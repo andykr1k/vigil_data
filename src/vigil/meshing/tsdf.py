@@ -10,6 +10,14 @@ of a detected leg bone (hip–knee–ankle–foot, from the recorded pose) and n
 `below` under that bone, measured along the floor's up direction. A support-plane cut then
 removes what the leg rests on, and an optional knee cut keeps only the thigh or the shin.
 
+Leg region "sam": no pose at all. The leg is clicked in a camera feed (or AUTO places the
+clicks, autoleg.py) and SAM 2 segments and tracks it in every camera's colour images
+(legmask.py); a pixel is kept when it's inside that mask (shrunk by SAM_ERODE_PX, where colour
+and aligned depth disagree). Section "knee" then cuts at the KNEE click (and the HIP click)
+instead of the knee detections. SAM segments objects, not body parts: shorts or trousers come
+out whole (both thighs, the buttock), so the thigh tube keeps only what's around the clicked
+thigh's axis; a BOX drawn in a camera feed crops to what it encloses.
+
 All geometry is in the recording's world frame (the first camera's colour optical frame,
 metres). Input is a recording written by vigil.recorder: meta.json, frames.jsonl and the
 per-camera colour / aligned-depth images.
@@ -43,6 +51,9 @@ log = logging.getLogger(__name__)
 LEG_NAMES = [j for j in LEG_JOINTS if j != "pelvis"]  # the leg itself (pelvis bones reach into the torso)
 MAX_VOXELS = 8_000_000  # ~160 MB of volume; the voxel size grows to stay under it
 MIN_JOINT_CONF = 0.3
+SAM_ERODE_PX = 2      # colour and aligned depth disagree by a pixel or two at the leg's outline
+TUBE_GROWTH = 0.1     # thigh tube: radius gained per metre up from the knee (the thigh widens)
+TUBE_MARGIN_M = 0.02  # thigh tube: slack beyond the thigh's measured radius above the knee
 
 
 
@@ -56,6 +67,8 @@ class TsdfParams:
     depth_min: float | None = None  # metres; None = the recording's depth window
     depth_max: float | None = None
     region: str = "pose"           # "pose" (half-capsule around leg bones) | "window" (depth window only)
+                                   # | "sam" (SAM 2 mask from clicks / AUTO / BOX, legmask.py)
+    prompts: dict | None = None    # region "sam": {"index": frame, "clicks": [{"cam", "x", "y", "kind"}]} (legmask.Prompts)
     leg: str = "both"              # "left" | "right" | "both"
     radius_cm: float = 11.0
     below_cm: float = 5.0
@@ -69,7 +82,10 @@ class TsdfParams:
     fill_holes: bool = True        # close holes smaller than max_hole_cm (never the outer edge)
     max_hole_cm: float = 5.0
     section: str = "above"         # "whole" | "above" (knee → hip, the thigh) | "below" (knee → foot)
+                                   # | "knee" (region "sam": cut at the KNEE click, keep the LEG click's side, and at the HIP click)
     knee_shift_cm: float = 0.0     # move the knee cut along the leg (+ = toward the hip)
+    tube: bool = True              # section "knee": keep only a tube around the thigh's axis (drops the other thigh,
+                                   # buttock and torso that SAM takes along when they're one garment)
 
     @classmethod
     def from_dict(cls, d: dict) -> TsdfParams:
@@ -257,11 +273,14 @@ def _edge_mask(depth_m: np.ndarray) -> np.ndarray:
 
 
 def _segment(depth_m: np.ndarray, view: _View, c: dict, p: TsdfParams, bones: list,
-             window: tuple[float, float]) -> np.ndarray:
-    """Depth with everything but the leg's upper surface zeroed."""
+             window: tuple[float, float], mask: np.ndarray | None = None) -> np.ndarray:
+    """Depth with everything but the leg's upper surface zeroed. `mask`: region "sam"'s leg pixels."""
     keep = (depth_m > window[0]) & (depth_m < window[1])
     if p.edge_filter:
         keep &= _edge_mask(depth_m)
+    if mask is not None:
+        k = 2 * SAM_ERODE_PX + 1
+        keep &= cv2.erode(mask.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
     if p.region == "pose":
         pts = _deproject(np.where(keep, depth_m, 0), c)[keep]
         r, below = p.radius_cm / 100, p.below_cm / 100
@@ -570,6 +589,160 @@ def _knee_section(entries: list[dict], pts: np.ndarray, p: TsdfParams, backend: 
             "knees_used": len(knees), "knees_seen": knees_seen, "warnings": warnings}
 
 
+def _click_section(entries: list[dict], pts: np.ndarray, p: TsdfParams, knee: dict, keep: dict,
+                   hip: dict | None = None) -> dict:
+    """Where to cut the leg from clicks (region "sam"): a plane through the KNEE click, across
+    the leg, keeping the side of the first LEG click. Both clicks are moved by the alignment of
+    their camera's frame nearest the click. `axis` points from the knee into the kept side: the
+    direction to the kept side's points within 25 cm of the knee, so a bent knee is cut across
+    the kept segment rather than across the whole leg's average direction.
+
+    `hip` (a HIP click): a second, parallel cut there, so the thigh stops at the hip instead of
+    running on into the buttock, the groin or the other leg. `t_hip` is its distance from the
+    knee along `axis`."""
+    def aligned(click: dict) -> np.ndarray:
+        own = [e for e in entries if e["view"].cam == click["cam"]]
+        if not own:
+            return np.asarray(click["point"], float)
+        e = min(own, key=lambda e: abs(e["view"].t - click["t"]))
+        return transform(e["cam"]["T"] @ np.linalg.inv(e["orig_T"]), np.asarray(click["point"], float))
+
+    k, s = aligned(knee), aligned(keep)
+    sample = pts[:: max(1, len(pts) // 20000)]
+    near = sample[np.linalg.norm(sample - k, axis=1) < 0.25]
+    axis = s - k
+    if np.linalg.norm(axis) < 1e-3:
+        raise MeshError("The LEG and KNEE clicks are on the same spot: put the LEG click on the part to keep.")
+    axis /= np.linalg.norm(axis)
+    for _ in range(2):
+        side = near[(near - k) @ axis > 0.02]
+        if len(side) >= 50:
+            axis = side.mean(0) - k
+            axis /= np.linalg.norm(axis)
+    warnings = []
+    if cKDTree(sample).query(k)[0] > 0.03:
+        warnings.append("The KNEE click isn't on the leg surface (more than 3 cm off); check the gold ring.")
+    t_cut = p.knee_shift_cm / 100
+    t_hip = None
+    if hip is not None:
+        t_hip = float((aligned(hip) - k) @ axis)
+        if t_hip < t_cut + 0.15:  # a thigh is longer than this: the HIP click is misplaced
+            warnings.append(f"The HIP click is only {t_hip * 100:.0f} cm up the leg from the knee; "
+                            "the thigh isn't cut at the hip.")
+            t_hip = None
+    return {"centre": k, "axis": axis, "t": t_cut, "knee": k + t_cut * axis,
+            "t_hip": t_hip, "hip": None if t_hip is None else k + t_hip * axis,
+            "knees_used": 1, "knees_seen": 1, "warnings": warnings}
+
+
+def _thigh_tube(pts: np.ndarray, section: dict) -> dict | None:
+    """The thigh as a widening tube, measured from the points just above the knee cut.
+
+    Those points (2–10 cm above the cut) are first narrowed to the connected piece of surface
+    the knee click is on, so the other knee or thigh lying alongside doesn't count. The axis
+    starts along the knee cut's axis through their middle, then is refitted (principal
+    direction) to the points inside the tube on the lower part of the thigh, where nothing else
+    comes close: the lower 75 % of knee → hip, or 25 cm without a hip. The radius above the
+    knee is what that piece needs (95th percentile), widening by TUBE_GROWTH, plus
+    TUBE_MARGIN_M. None if there are too few points there."""
+    k, t0, t_hip = np.asarray(section["centre"], float), float(section["t"]), section.get("t_hip")
+    d = np.asarray(section["axis"], float)
+    fit_len = 0.75 * (t_hip - t0) if t_hip is not None else 0.25
+
+    def lateral(o, d, X=pts):
+        rel = X - o
+        s = rel @ d
+        return s, np.linalg.norm(rel - np.outer(s, d), axis=1)
+
+    s, _ = lateral(k, d)
+    low = pts[(s >= t0 + 0.02) & (s <= t0 + 0.10)]
+    low = low[:: max(1, len(low) // 5000)]
+    if len(low) < 200:
+        return None
+    pairs = cKDTree(low).query_pairs(0.015, output_type="ndarray")
+    graph = sparse.coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(len(low),) * 2)
+    labels = connected_components(graph, directed=False)[1]
+    low = low[labels == labels[np.argmin(np.linalg.norm(low - k, axis=1))]]
+    if len(low) < 100:
+        return None
+    rel = low - k
+    o = k + np.median(rel - np.outer(rel @ d, d), 0)
+    r0 = float(np.percentile(lateral(o, d, low)[1], 95))
+    for _ in range(3):
+        s, lat = lateral(o, d)
+        fit = (s >= t0 + 0.02) & (s <= t0 + fit_len) & (lat <= r0 + TUBE_GROWTH * (s - t0) + TUBE_MARGIN_M)
+        if fit.sum() < 200:
+            break
+        q = pts[fit]
+        m = q.mean(0)
+        dn = np.linalg.svd(q - m, full_matrices=False)[2][0]
+        dn = dn if dn @ d > 0 else -dn
+        if dn @ d < np.cos(np.radians(25)):  # not the thigh's direction any more
+            break
+        d, o = dn, m + ((k - m) @ dn) * dn
+        r0 = float(np.percentile(lateral(o, d, low)[1], 95))
+    return {"origin": o, "axis": d, "t0": t0, "r0": r0}
+
+
+def _tube_radius(tube: dict, s) -> np.ndarray:
+    return tube["r0"] + TUBE_GROWTH * np.maximum(s - tube["t0"], 0) + TUBE_MARGIN_M
+
+
+def _in_tube(X: np.ndarray, tube: dict) -> np.ndarray:
+    rel = X - tube["origin"].astype(X.dtype)
+    s = rel @ tube["axis"].astype(X.dtype)
+    lat = np.linalg.norm(rel - np.outer(s, tube["axis"]).astype(X.dtype), axis=1)
+    return lat <= _tube_radius(tube, s)
+
+
+def _box_crop(entries: list[dict], boxes: dict[int, list[float]], t: float, warnings: list) -> dict:
+    """Keep only what lies inside every BOX. A box is a rectangle in one camera's image, so in
+    3D it's a pyramid from that camera; a point stays when it projects inside each box. The
+    projection uses the box camera's frame nearest the prompt time, after alignment (which
+    moved every frame onto it), so the leg's motion over the time window doesn't matter."""
+    poses = {}
+    for cam, b in boxes.items():
+        own = [e for e in entries if e["view"].cam == cam]
+        if not own:
+            warnings.append(f"CAM {cam + 1}'s BOX has no depth frames in the mesh; it isn't applied.")
+            continue
+        c = min(own, key=lambda e: abs(e["view"].t - t))["cam"]
+        poses[cam] = (np.linalg.inv(c["T"]).astype(np.float32), c, b)
+
+    def inside(X: np.ndarray) -> np.ndarray:
+        ok = np.ones(len(X), bool)
+        for T_inv, c, (x0, y0, x1, y1) in poses.values():
+            q = transform(T_inv, X.astype(np.float32))
+            z = np.maximum(q[:, 2], 1e-6)
+            u, v = q[:, 0] * c["fx"] / z + c["cx"], q[:, 1] * c["fy"] / z + c["cy"]
+            ok &= (q[:, 2] > 0.05) & (u >= x0) & (u <= x1) & (v >= y0) & (v <= y1)
+        return ok
+
+    n_before = sum(len(e["pts"]) for e in entries)
+    for e in entries:
+        world = _deproject(_metres(e), e["cam"])
+        on = e["seg"] > 0
+        keep = np.zeros_like(on)
+        keep[on] = inside(world[on])
+        e["seg"][on & ~keep] = 0
+        k = inside(e["pts"])
+        e["pts"], e["nrm"] = e["pts"][k], e["nrm"][k]
+    return {"cameras": sorted(int(c) for c in poses),
+            "removed": round(1 - sum(len(e["pts"]) for e in entries) / max(n_before, 1), 3)}
+
+
+def section_stats(section: dict | None, p: TsdfParams) -> dict | None:
+    """What a mesh's stats say about its knee / hip cuts and thigh tube."""
+    if section is None:
+        return None
+    vec = lambda x: [round(float(v), 4) for v in x]  # noqa: E731
+    return {"mode": p.section, "knee": vec(section["knee"]),
+            "hip": None if section.get("hip") is None else vec(section["hip"]),
+            "axis": vec(section["axis"]), "shift_cm": p.knee_shift_cm,
+            "knees_used": section["knees_used"], "knees_seen": section["knees_seen"],
+            "tube": section.get("tube")}
+
+
 def _with_correction(c: dict, T_corr: np.ndarray) -> dict:
     T = T_corr @ c["T"]
     return {**c, "T": T, "T_inv": np.linalg.inv(T)}
@@ -720,6 +893,42 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
         raise MeshError("No depth frames from the selected cameras around this frame.")
     bones_def = meta["hello"].get("bones", [])
 
+    # 0. Region "sam": the clicked leg, segmented and tracked through every view's colour image.
+    sam, prompts, segmentation, warnings_sam = None, None, None, []
+    if p.region == "sam":
+        from . import legmask
+        prompts = legmask.Prompts.parse(p.prompts, len(lines))
+        line_of = {}  # depth file -> its line in frames.jsonl
+        for i, ln in enumerate(lines):
+            for f in ln["files"]:
+                if "depth" in f:
+                    line_of[f["depth"]] = i
+        wanted: dict[int, list[int]] = {}
+        for view in views:
+            wanted.setdefault(view.cam, []).append(line_of[str(view.depth)])
+        progress("segmenting (SAM 2)", 0.0)
+        sam = legmask.segment(path, meta, lines, prompts, wanted, progress)
+
+        def area_stats(masks: dict) -> dict:
+            # How steady the tracked mask is: a leg the tracker loses or swaps for the other leg
+            # shows up as a jump in its area.
+            px = np.array([m.sum() for m in masks.values()], float)
+            if not len(px):
+                return {"mask_px": 0, "mask_px_cv": None}
+            return {"mask_px": int(np.median(px)),
+                    "mask_px_cv": round(float(px.std() / px.mean()), 3) if px.mean() > 0 else None}
+
+        segmentation = {"model": legmask.MODEL_ID, "frame": prompts.index, "clicks": prompts.clicks,
+                        "cameras": {cam: {"source": r["source"], "points": r["points"], "box": r.get("box"),
+                                          **area_stats(r["masks"])}
+                                    for cam, r in sam.items()}}
+        if not any(r["masks"] for r in sam.values()):
+            raise MeshError("SAM 2 found no leg to track. Click the leg again on this frame.")
+        missing = [cam + 1 for cam in wanted if not (sam.get(cam) or {}).get("masks")]
+        if missing:
+            warnings_sam.append(f"CAM {', '.join(map(str, missing))}: no leg prompts could be carried over; "
+                                "click the leg in that camera too.")
+
     # 1. Segment every view down to the leg (and sample its points + normals).
     progress("segmenting", 0.0)
     entries, joints_used = [], set()  # {view, seg, cam (pose, maybe corrected), pts, nrm}
@@ -729,13 +938,17 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
         if raw is None:
             continue
         depth_m = raw.astype(np.float32) * 0.001
-        bones = []
+        bones, mask = [], None
         if p.region == "pose":
             bones = _leg_bones(view.joints, p.leg, bones_def)
             if not bones:
                 continue
             joints_used |= {k2 for k2 in view.joints if k2 in LEG_NAMES}
-        seg = _segment(depth_m, view, c, p, bones, window)
+        elif p.region == "sam":
+            mask = (sam.get(view.cam) or {}).get("masks", {}).get(line_of[str(view.depth)])
+            if mask is None or not mask.any():
+                continue
+        seg = _segment(depth_m, view, c, p, bones, window, mask)
         if not seg.any():
             continue
         world = _deproject(seg, c)
@@ -748,8 +961,11 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
         if p.region == "pose":
             raise MeshError("No leg joints detected in this time window (or the leg region was empty). "
                             "Move to a frame with a detected leg, or use region = depth window.")
+        if p.region == "sam":
+            raise MeshError("The clicked leg has no depth inside the depth window. Check NEAR / FAR.")
         raise MeshError("Nothing inside the depth window.")
-    warnings, support, align_stats = [], None, None
+    warnings, support, align_stats = list(warnings_sam), None, None
+    support_removed = 0.0
 
     # 2. Align. Each camera's frame nearest the current time is snapped onto the world
     #    camera's (absorbing calibration error, with the slide along the leg locked); every
@@ -758,6 +974,14 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
         align_stats, failed = _align(entries, lines[index]["t"], progress)
         if failed > len(entries) / 2:
             warnings.append(f"Alignment failed for {failed} of {len(entries) - 1} frames (kept as recorded).")
+
+    # 2b. BOX prompts: keep what lies inside every drawn box.
+    boxes = prompts.boxes() if prompts is not None else {}
+    if boxes:
+        segmentation["box"] = _box_crop(entries, boxes, lines[prompts.index]["t"], warnings)
+        entries = [e for e in entries if e["seg"].any() and len(e["pts"])]
+        if not entries:
+            raise MeshError("Nothing with depth inside the BOX. Draw it around the thigh again.")
 
     # 3. Cut away what the leg rests on.
     pts = np.concatenate([e["pts"] for e in entries])
@@ -770,23 +994,75 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
             for e in entries:
                 world = _deproject(_metres(e), e["cam"])
                 e["seg"][(world @ n.astype(np.float32)) < cut] = 0
+            n_before = len(pts)
             pts = pts[pts @ n >= cut]
+            support_removed = 1 - len(pts) / max(n_before, 1)
             if not len(pts):
                 raise MeshError("Everything lies on the support surface; turn 'cut support' off.")
 
-    # 3b. Keep one side of the knee.
+    # 3b. Keep one side of the knee ("knee": the clicked knee; the axis points into the kept side,
+    #     so it keeps the same side as "above").
     section = None
-    if p.section in ("above", "below"):
+    if p.section == "knee" and p.region != "sam":
+        raise MeshError("CUT AT KNEE CLICK needs the SAM 2 leg region.")
+    if p.section == "knee":
+        from . import legmask
+        knee_click, keep_click, hip_click = prompts.first("knee"), prompts.first("leg"), prompts.first("hip")
+        if knee_click is None or keep_click is None:  # a BOX alone crops instead
+            if not boxes:
+                raise MeshError("Click the knee (KNEE mode) in a camera feed, or draw a BOX around the thigh.")
+            if knee_click is not None:
+                warnings.append("No + LEG click to say which side of the knee to keep; not cut at the knee.")
+        else:
+            knee = legmask.click_point(path, meta, lines, prompts, knee_click)
+            keep = legmask.click_point(path, meta, lines, prompts, keep_click)
+            if knee is None or keep is None:
+                raise MeshError("No depth under the KNEE or LEG click. Click again on the leg itself.")
+            hip = legmask.click_point(path, meta, lines, prompts, hip_click) if hip_click else None
+            if hip_click and hip is None:
+                warnings.append("No depth under the HIP click; the thigh isn't cut at the hip.")
+            section = _click_section(entries, pts, p, knee, keep, hip)
+    elif p.section in ("above", "below"):
         section = _knee_section(entries, pts, p, meta["hello"].get("backend"), limb_radius)
-        u, t_cut = np.asarray(section["axis"]), section["t"]
+    if section is not None:
+        u, t_cut, t_hip = np.asarray(section["axis"]), section["t"], section.get("t_hip")
+        below = p.section == "below"
         for e in entries:
             s_ = (_deproject(_metres(e), e["cam"]) - section["centre"]) @ u.astype(np.float32)
-            e["seg"][(s_ < t_cut) if p.section == "above" else (s_ > t_cut)] = 0
+            e["seg"][(s_ > t_cut) if below else (s_ < t_cut)] = 0
+            if t_hip is not None:
+                e["seg"][s_ > t_hip] = 0
         s_pts = (pts - section["centre"]) @ u
-        pts = pts[(s_pts >= t_cut) if p.section == "above" else (s_pts <= t_cut)]
+        pts = pts[(s_pts <= t_cut) if below else (s_pts >= t_cut)]
+        if t_hip is not None:
+            pts = pts[(pts - section["centre"]) @ u <= t_hip]
         if len(pts) < 100 or not any(e["seg"].any() for e in entries):
-            raise MeshError("Nothing left on that side of the knee. Check KNEE SHIFT, or use WHOLE LEG.")
+            raise MeshError("Nothing left on that side of the knee. Check KNEE SHIFT, or use WHOLE LEG."
+                            if p.section != "knee" else "Nothing left on that side of the knee. Check KNEE SHIFT and the KNEE click.")
         warnings.extend(section.pop("warnings"))
+
+    # 3c. Thigh tube: SAM keeps a garment whole, so drop what's far from the thigh's axis.
+    if section is not None and p.section == "knee" and p.tube:
+        tube = _thigh_tube(pts, section)
+        if tube is None:
+            warnings.append("Too little thigh just above the knee to measure it; the thigh tube is off.")
+        else:
+            for e in entries:
+                world = _deproject(_metres(e), e["cam"])
+                on = e["seg"] > 0
+                keep_px = np.zeros_like(on)
+                keep_px[on] = _in_tube(world[on], tube)
+                e["seg"][on & ~keep_px] = 0
+            n_before = len(pts)
+            pts = pts[_in_tube(pts, tube)]
+            if len(pts) < 100:
+                raise MeshError("Nothing left inside the thigh tube; turn THIGH TUBE off.")
+            s_top = float(((pts - tube["origin"]) @ tube["axis"]).max())
+            section["tube"] = {"radius_cm": [round(float(_tube_radius(tube, tube["t0"])) * 100, 1),
+                                             round(float(_tube_radius(tube, s_top)) * 100, 1)],
+                               "removed": round(1 - len(pts) / max(n_before, 1), 3)}
+    if segmentation is not None:
+        segmentation["support_removed"] = round(support_removed, 3)
 
     # 4. Volume around the leg points (robust bounds: ignore the 0.5 % most extreme points).
     margin = p.trunc_mm / 1000 + 2 * p.voxel_mm / 1000
@@ -839,12 +1115,10 @@ def build_tsdf(path: Path, meta: dict, lines: list, index: int, params: TsdfPara
         "views": per_cam, "voxel_mm": round(voxel * 1000, 2), "grid": [int(n) for n in vol.shape],
         "vertices": int(len(verts)), "faces": int(len(faces)), "area_cm2": round(area * 1e4, 1),
         "joints": sorted(joints_used), "align": align_stats, "holes": holes,
-        "section": None if section is None else {
-            "mode": p.section, "knee": [round(float(x), 4) for x in section["knee"]],
-            "axis": [round(float(x), 4) for x in section["axis"]], "shift_cm": p.knee_shift_cm,
-            "knees_used": section["knees_used"], "knees_seen": section["knees_seen"]},
+        "section": section_stats(section, p),
         "support": None if support is None else {"normal": [round(float(x), 4) for x in support[0]],
                                                   "d": round(support[1], 4)},
+        "segmentation": segmentation,
         "build_s": round(time.monotonic() - t_start, 2),
         "params": asdict(p), "warnings": warnings,
     }

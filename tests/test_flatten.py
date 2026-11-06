@@ -1,7 +1,7 @@
-"""FLATTEN MESH: SCAF / ARAP unrolling of a saved surface, its checks, and the Meshes/ files.
+"""FLATTEN MESH: SCAF / SLIM / ARAP unrolling of a saved surface, its checks, and the Meshes/ files.
 
 The surface is a third of a cylinder (like the top of a thigh). A cylinder unrolls without
-any stretch, so both methods must give a flat sheet the size of the arc × the length.
+any stretch, so every method must give a flat sheet the size of the arc × the length.
 The native solver is built with CMake on first use; the tests skip if that isn't possible.
 """
 
@@ -39,7 +39,7 @@ def cylinder_patch(n_around: int = 24, n_along: int = 30, hole: bool = False) ->
     return Mesh(verts, faces, normals, colors, {"method": "tsdf", "frame": 4, "seq": 104, "time_s": 1.5})
 
 
-@pytest.mark.parametrize("method", ["scaf", "arap"])
+@pytest.mark.parametrize("method", ["scaf", "slim", "arap"])
 def test_cylinder_patch_unrolls_without_stretch(method):
     result = flatten_mesh(cylinder_patch(), method, 50)
     s, a = result.flat.stats, result.arrays
@@ -77,7 +77,7 @@ def test_small_holes_are_patched_and_marked():
 
 def test_rejects_bad_requests():
     with pytest.raises(MeshError):
-        flatten_mesh(cylinder_patch(), "slim")
+        flatten_mesh(cylinder_patch(), "bff")
     with pytest.raises(MeshError):
         flatten_mesh(cylinder_patch(), "scaf", 0)
     flat = flatten_mesh(cylinder_patch(), "arap", 10).flat

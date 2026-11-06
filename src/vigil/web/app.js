@@ -262,6 +262,10 @@ function buildRig(cameras) {
     feeds.appendChild(wrap);
     const feed = wrap.querySelector("canvas");
     feed.style.aspectRatio = `${cam.width} / ${cam.height}`;
+    feed.addEventListener("click", (ev) => samClick(cam, feed, ev));
+    feed.addEventListener("pointerdown", (ev) => samBoxStart(cam, feed, ev));
+    feed.addEventListener("pointermove", (ev) => samBoxMove(cam, feed, ev));
+    feed.addEventListener("pointerup", (ev) => samBoxEnd(cam, feed, ev));
     return { info: cam, group, cloud, feed, ctx: feed.getContext("2d"), image: null };
   });
   renderRigList();
@@ -812,6 +816,7 @@ function drawFeed(rc) {
   c.drawImage(rc.image, 0, 0, w, h);
   c.fillStyle = "rgba(2,6,12,0.25)";
   c.fillRect(0, 0, w, h);
+  if (samRegion() && (samUI.index !== null || samUI.drag)) { drawSam(rc, c, w, h); return; } // the leg clicks replace the pose overlay
   const view = lastFrame?.views?.[rc.info.index];
   if (!view) return;
 
@@ -1137,6 +1142,7 @@ function connect() {
     else if (msg.type === "mesh_progress") onMeshProgress(msg);
     else if (msg.type === "flatten_progress") onFlatProgress(msg);
     else if (msg.type === "meshes_changed") loadLibrary();
+    else if (msg.type === "scan") onScan(msg);
   };
 }
 
@@ -1147,18 +1153,30 @@ const PROC_ICONS = {
 };
 const CHECK_ICONS = { pending: "○", active: "", done: "✓", warn: "!", error: "✕" };
 let bootState = null;
+let bootHideTimer = null;
 
 function onBoot(msg) {
+  window.dispatchEvent(new Event("vigil:startup-status"));
   const boot = $("boot"), prev = bootState;
   bootState = msg.state;
   const show = msg.state === "select" || msg.state === "loading" || (msg.state === "error" && msg.checks);
   if (!show) {
     if (!boot.hidden && !boot.classList.contains("leaving")) {
       boot.classList.add("leaving"); // fade out once everything is up
-      setTimeout(() => { boot.hidden = true; boot.classList.remove("leaving"); }, 600);
+      bootHideTimer = setTimeout(() => {
+        boot.hidden = true;
+        boot.classList.remove("leaving");
+        bootHideTimer = null;
+      }, 600);
     }
     return;
   }
+  // A new startup/status can arrive while the previous overlay is fading out.
+  // Cancel that dismissal or it will hide the new procedure selector 600 ms later.
+  clearTimeout(bootHideTimer);
+  bootHideTimer = null;
+  boot.classList.remove("leaving");
+  boot.classList.toggle("failed", msg.state === "error");
   boot.hidden = false;
   const selecting = msg.state === "select";
   $("boot-choices").hidden = !selecting;
@@ -1349,11 +1367,218 @@ function onFrame(frame) {
 // ───────────────────────────── mesh methods ─────────────────────────────
 // Surface meshes are built server-side at the replay's current frame (POST /api/surface/build)
 // and fetched as one binary blob: u32 V, u32 F, f32 xyz, f32 normals, u8 rgb (padded), u32 faces.
+// Leg clicks (LEG REGION = SAM 2 THIGH). Clicks on a camera feed, in image pixels, prompt SAM 2
+// on the server (POST /api/surface/leg-mask), which answers with every camera's leg mask on that
+// frame as an overlay PNG. The clicks belong to one replay frame (clicking on another frame starts
+// over); BUILD MESH sends them along and the server tracks the leg from that frame.
+const samUI = { kind: "leg", index: null, clicks: [], cams: {}, seq: 0 };
+const SAM_COLORS = { leg: "#3dffa8", not: "#ff3d6e", knee: "#ffd23d", hip: "#3db4ff", box: "#ff9f1c" };
+const SAM_HINT = "Press AUTO, click the leg in a camera feed below, or pick BOX and drag a box around the thigh. One camera is enough: the others get prompts through depth.";
+const hasLegPrompt = () => samUI.clicks.some((c) => c.kind === "leg" || c.kind === "box");
+
+function redrawFeeds() { for (const rc of rigCams) drawFeed(rc); }
+function samMsg(text, cls = "") { $("sam-msg").textContent = text; $("sam-msg").className = `rig-msg ${cls}`; }
+function samReset() { samUI.index = null; samUI.clicks = []; samUI.cams = {}; samUI.auto = null; samUI.seq++; samMsg(SAM_HINT); redrawFeeds(); }
+
+function samRegion() { return document.querySelector("#mesh-region .on")?.dataset.region === "sam"; }
+function samCanClick() { return samRegion() && !surface.building && hello?.replay && lastFrame?.replay; }
+function samStartFrame() {
+  if (samUI.index !== lastFrame.replay.index) { samReset(); samUI.index = lastFrame.replay.index; }
+  if (lastFrame.replay.playing) send({ cmd: "replay_ctl", play: false }); // the clicks belong to this frame
+  samUI.auto = null; // hand-edited from here on
+}
+function feedPixel(cam, feed, ev) {
+  const r = feed.getBoundingClientRect();
+  return [Math.round(Math.min(Math.max((ev.clientX - r.left) / r.width, 0), 1) * cam.width),
+    Math.round(Math.min(Math.max((ev.clientY - r.top) / r.height, 0), 1) * cam.height)];
+}
+
+function samClick(cam, feed, ev) {
+  if (samUI.kind === "box" || !samCanClick()) return; // BOX drags instead
+  samStartFrame();
+  const [x, y] = feedPixel(cam, feed, ev);
+  samUI.clicks.push({ cam: cam.index, kind: samUI.kind, x, y });
+  samPreview();
+}
+
+// BOX: drag a rectangle around the thigh. It's a SAM box prompt in that camera, and the mesh keeps
+// only what lies inside it (in 3D, so every camera). One box per camera: a new one replaces it.
+function samBoxStart(cam, feed, ev) {
+  if (samUI.kind !== "box" || ev.button !== 0 || !samCanClick()) return;
+  const [x, y] = feedPixel(cam, feed, ev);
+  samUI.drag = { cam: cam.index, x, y, x2: x, y2: y };
+  feed.setPointerCapture(ev.pointerId);
+}
+function samBoxMove(cam, feed, ev) {
+  if (samUI.drag?.cam !== cam.index) return;
+  [samUI.drag.x2, samUI.drag.y2] = feedPixel(cam, feed, ev);
+  drawFeed(rigCams.find((rc) => rc.info.index === cam.index));
+}
+function samBoxEnd(cam, feed, ev) {
+  const d = samUI.drag;
+  if (d?.cam !== cam.index) return;
+  samUI.drag = null;
+  [d.x2, d.y2] = feedPixel(cam, feed, ev);
+  if (Math.abs(d.x2 - d.x) < 8 || Math.abs(d.y2 - d.y) < 8) { redrawFeeds(); return; } // a click, not a box
+  samStartFrame();
+  samUI.clicks = samUI.clicks.filter((c) => !(c.kind === "box" && c.cam === cam.index));
+  samUI.clicks.push({ cam: cam.index, kind: "box", x: Math.min(d.x, d.x2), y: Math.min(d.y, d.y2),
+    x2: Math.max(d.x, d.x2), y2: Math.max(d.y, d.y2) });
+  samPreview();
+}
+
+function loadImage(src) {
+  return new Promise((ok, fail) => { const im = new Image(); im.onload = () => ok(im); im.onerror = fail; im.src = src; });
+}
+
+async function samPreview() {
+  const seq = ++samUI.seq;
+  redrawFeeds();
+  if (!hasLegPrompt()) {
+    samUI.cams = {};
+    samMsg(samUI.clicks.length ? "Add a + LEG click on the leg, or a BOX around the thigh." : SAM_HINT);
+    redrawFeeds();
+    return;
+  }
+  samMsg("SAM 2: segmenting… (the first time also loads the model, ~10 s)");
+  try {
+    const r = await fetch("/api/surface/leg-mask", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ index: samUI.index, clicks: samUI.clicks }) });
+    const res = await r.json();
+    if (!r.ok) throw new Error(res.error ?? `HTTP ${r.status}`);
+    const cams = {};
+    for (const [cam, v] of Object.entries(res.cameras))
+      cams[cam] = { ...v, image: v.png ? await loadImage(`data:image/png;base64,${v.png}`) : null };
+    if (seq !== samUI.seq) return; // a newer click's preview is on its way
+    samUI.cams = cams;
+    const parts = (hello?.cameras ?? []).filter((c) => c.T_world_camera).map((c) => {
+      const v = cams[c.index];
+      const what = !v?.source ? "no leg found, click it here too" : v.source === "clicks" ? "your clicks"
+        : `prompted from ${v.source}`;
+      return `CAM ${c.index + 1}: ${what}`;
+    });
+    const missing = parts.some((s) => s.includes("click it here"));
+    const box = samUI.clicks.some((c) => c.kind === "box");
+    const knee = !box && !samUI.clicks.some((c) => c.kind === "knee");
+    samMsg(autoNote() + `Frame ${samUI.index + 1} · ${parts.join(" · ")}.` + (knee ? " Add a KNEE click for the knee cut." : "") +
+      (box ? " The mesh keeps only what's inside the BOX, seen from every camera." : " Wrong area? Add − NOT LEG there."),
+      missing || knee ? "" : "ok");
+  } catch (e) {
+    if (seq === samUI.seq) samMsg(e.message, "err");
+  }
+  redrawFeeds();
+}
+
+function drawSam(rc, c, w, h) {
+  if (samUI.index === null && !samUI.drag) return;
+  if (samUI.index !== null && lastFrame?.replay?.index !== samUI.index) {
+    c.fillStyle = SAM_COLORS.knee;
+    c.font = "10px monospace";
+    c.fillText(`LEG CLICKS ARE ON FRAME ${samUI.index + 1}`, 8, h - 8);
+    return;
+  }
+  const cam = rc.info, sx = w / cam.width, sy = h / cam.height, res = samUI.cams[cam.index];
+  if (res?.image) c.drawImage(res.image, 0, 0, w, h);
+  if (res?.source && res.source !== "clicks") { // prompts carried over from another camera
+    c.strokeStyle = SAM_COLORS.leg;
+    c.lineWidth = 1.5;
+    for (const [x, y] of res.points) { c.beginPath(); c.arc(x * sx, y * sy, 4, 0, Math.PI * 2); c.stroke(); }
+  }
+  for (const b of [...samUI.clicks.filter((k) => k.kind === "box"), ...(samUI.drag ? [samUI.drag] : [])]) {
+    if (b.cam !== cam.index) continue;
+    c.strokeStyle = SAM_COLORS.box;
+    c.lineWidth = 2;
+    c.setLineDash(b === samUI.drag ? [5, 4] : []);
+    c.strokeRect(Math.min(b.x, b.x2) * sx, Math.min(b.y, b.y2) * sy, Math.abs(b.x2 - b.x) * sx, Math.abs(b.y2 - b.y) * sy);
+    c.setLineDash([]);
+    c.fillStyle = SAM_COLORS.box;
+    c.font = "bold 10px monospace";
+    c.fillText("BOX", Math.min(b.x, b.x2) * sx + 4, Math.min(b.y, b.y2) * sy + 12);
+  }
+  for (const k of samUI.clicks) {
+    if (k.cam !== cam.index || k.kind === "box") continue;
+    const x = k.x * sx, y = k.y * sy;
+    c.fillStyle = SAM_COLORS[k.kind];
+    c.strokeStyle = "#02050a";
+    c.lineWidth = 1.5;
+    c.beginPath(); c.arc(x, y, 6, 0, Math.PI * 2); c.fill(); c.stroke();
+    c.beginPath(); // + / − / K glyph
+    c.moveTo(x - 3, y); c.lineTo(x + 3, y);
+    if (k.kind === "leg") { c.moveTo(x, y - 3); c.lineTo(x, y + 3); }
+    if (k.kind === "knee") { c.moveTo(x - 2, y - 3); c.lineTo(x - 2, y + 3); }
+    if (k.kind === "hip") { c.moveTo(x - 2, y - 3); c.lineTo(x - 2, y + 3); c.moveTo(x + 2, y - 3); c.lineTo(x + 2, y + 3); }
+    c.stroke();
+  }
+}
+
+document.querySelectorAll("#sam-kind button").forEach((b) => (b.onclick = () => {
+  samUI.kind = b.dataset.kind;
+  setSeg("sam-kind", "kind", b.dataset.kind);
+}));
+$("sam-undo").onclick = () => { if (samUI.clicks.length) { samUI.clicks.pop(); samUI.auto = null; samPreview(); } };
+// AUTO: the server proposes the clicks (Sapiens2: leg, knee, hip); they land as ordinary clicks,
+// previewed with SAM 2 and correctable like any others.
+$("sam-auto-leg").value = store.get("mesh.autoLeg", "auto");
+$("sam-auto-leg").onchange = (e) => store.set("mesh.autoLeg", e.target.value);
+// Fills samUI with the server's proposal for the current frame; throws AUTO's reason if it can't.
+async function runAuto() {
+  if (lastFrame.replay.playing) send({ cmd: "replay_ctl", play: false });
+  const index = lastFrame.replay.index, seq = ++samUI.seq, btn = $("sam-auto");
+  btn.disabled = true;
+  samMsg("AUTO: finding the leg, knee and hip… (the first time also loads Sapiens2)");
+  try {
+    const r = await fetch("/api/surface/auto-prompts", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ index, side: $("sam-auto-leg").value }) });
+    const res = await r.json();
+    if (!r.ok) throw new Error(res.error ?? `HTTP ${r.status}`);
+    if (seq !== samUI.seq) return;
+    samUI.index = res.prompts.index;
+    samUI.clicks = res.prompts.clicks;
+    samUI.auto = res;
+    await samPreview();
+  } catch (e) {
+    if (seq === samUI.seq) samMsg(`AUTO: ${e.message}`, "err");
+    throw e;
+  } finally {
+    btn.disabled = surface.building;
+  }
+}
+$("sam-auto").onclick = () => {
+  if (surface.building || !hello?.replay || !lastFrame?.replay) return;
+  runAuto().catch(() => {}); // the reason is already in the SAM message
+};
+// BUILD MESH with no clicks runs AUTO first, so a build never needs clicking.
+// Returns false (with the reason shown) if AUTO can't prompt this frame.
+async function ensurePrompts() {
+  if (samUI.clicks.length) return true;
+  $("mesh-state").textContent = "AUTO";
+  $("mesh-msg").className = "rig-msg";
+  $("mesh-msg").textContent = "No clicks: running AUTO first…";
+  try {
+    await runAuto();
+    return samUI.clicks.length > 0;
+  } catch (e) {
+    $("mesh-state").textContent = "FAILED";
+    $("mesh-msg").className = "rig-msg err";
+    $("mesh-msg").textContent = `AUTO couldn't prompt this frame: ${e.message} Try another frame, or click the leg and knee.`;
+    return false;
+  }
+}
+function autoNote() {
+  const a = samUI.auto;
+  if (!a) return "";
+  const knee = a.knee ? `knee ±${a.knee.jitter_cm} cm, cameras ${a.knee.disagree_cm} cm apart` : "";
+  return `AUTO: ${a.side.toUpperCase()} leg from ${a.source === "parts" ? "body parts" : a.source === "pose" ? "keypoints" : "parts + keypoints"}` +
+    ` · ${knee}${a.hip ? ` · thigh ${a.hip.length_cm} cm` : " · no hip cut"}.` + (a.warnings.length ? ` ${a.warnings.join(" ")}` : "") + " ";
+}
+$("sam-clear").onclick = () => samReset();
+samMsg(SAM_HINT);
+
 const MESH_DEFAULTS = {
   window_s: 0.5, max_frames: 30, radius_cm: 11, below_cm: 5, depth_min: 0.2, depth_max: 0.85,
   support: true, edge_filter: true, support_margin_cm: 1.5, voxel_mm: 3, trunc_mm: 12, smooth: 4,
   align: true, largest: true, region: "pose", leg: "both", section: "above", knee_shift_cm: 0,
-  blend: true, fill_holes: true, max_hole_cm: 5,
+  blend: true, fill_holes: true, max_hole_cm: 5, tube: true,
 };
 const meshInputs = [...document.querySelectorAll("#panel-mesh [data-mp]")];
 const meshCams = new Set(); // camera indices switched OFF
@@ -1379,9 +1604,14 @@ function meshApply(p) {
   setSeg("mesh-region", "region", p.region);
   setSeg("mesh-leg", "leg", p.leg);
   setSeg("mesh-section", "section", p.section);
-  document.querySelectorAll("#panel-mesh .knee-only").forEach((l) => (l.hidden = p.section === "whole"));
+  const sam = p.region === "sam"; // SAM 2 THIGH: always knee → hip, cut at the KNEE (and HIP) click
+  document.querySelectorAll("#panel-mesh .knee-only").forEach((l) => (l.hidden = !sam && p.section === "whole"));
   document.querySelectorAll("#panel-mesh .pose-only").forEach((l) => (l.hidden = p.region !== "pose"));
   $("mesh-leg").hidden = p.region !== "pose";
+  $("mesh-section").hidden = sam;
+  $("sam-tools").hidden = !sam;
+  $("feeds").classList.toggle("sam-pick", sam);
+  redrawFeeds();
 }
 function meshParams() {
   const p = {};
@@ -1391,9 +1621,17 @@ function meshParams() {
   p.section = document.querySelector("#mesh-section .on")?.dataset.section ?? "above";
   const all = (hello?.cameras ?? []).filter((c) => c.T_world_camera).map((c) => c.index);
   p.cameras = meshCams.size ? all.filter((i) => !meshCams.has(i)) : null;
+  if (p.region === "sam") {
+    p.section = "knee";
+    p.prompts = samUI.clicks.length ? { index: samUI.index, clicks: samUI.clicks } : null;
+  }
   return p;
 }
-function meshSave() { const p = meshParams(); delete p.cameras; store.set("mesh.params", p); }
+function meshSave() {
+  const p = meshParams(); delete p.cameras; delete p.prompts;
+  if (p.region === "sam") delete p.section; // keep the pose/window regions' own section
+  store.set("mesh.params", { ...store.get("mesh.params", {}), ...p });
+}
 
 meshApply({ ...MESH_DEFAULTS, ...store.get("mesh.params", {}) });
 meshInputs.forEach((el) => el.addEventListener("input", () => {
@@ -1404,7 +1642,8 @@ meshInputs.forEach((el) => el.addEventListener("input", () => {
 }));
 function $q(mp) { return document.querySelector(`#panel-mesh [data-mp="${mp}"]`); }
 document.querySelectorAll("#mesh-region button").forEach((b) => (b.onclick = () => {
-  meshApply({ ...meshParams(), region: b.dataset.region }); meshSave();
+  meshApply({ ...meshParams(), section: store.get("mesh.params", {}).section ?? MESH_DEFAULTS.section, region: b.dataset.region });
+  meshSave();
 }));
 document.querySelectorAll("#mesh-section button").forEach((b) => (b.onclick = () => {
   meshApply({ ...meshParams(), section: b.dataset.section }); meshSave();
@@ -1436,7 +1675,11 @@ function renderMeshCams() {
 }
 
 function meshOnHello(msg) {
+  scanUI.epoch += 1; // invalidate any result downloads started in a different scene
+  scanUI.requested = null;
   clearSurface();
+  samReset();
+  $("scan-tools").hidden = !!msg.replay;
   meshCams.clear();
   renderMeshCams();
   surface.needDepth = true; // start from the recording's own depth window
@@ -1475,6 +1718,7 @@ function onMeshProgress(msg) {
 
 $("mesh-build").onclick = async () => {
   if (surface.building || !lastFrame?.replay) return;
+  if (samRegion() && !(await ensurePrompts())) return;
   surface.building = true;
   const btn = $("mesh-build");
   btn.textContent = "BUILDING…"; btn.classList.add("busy"); btn.disabled = true;
@@ -1512,6 +1756,74 @@ $("mesh-build").onclick = async () => {
   }
 };
 
+// Live capture → existing reconstruction → existing unfolding. Results never open replay.
+const scanUI = { result: null, busy: false, epoch: 0, requested: null, display: Promise.resolve() };
+const scanCameraKey = (cameras) => JSON.stringify((cameras ?? []).map((c) => [c.serial, c.T_world_camera]));
+$("scan-seconds").value = store.get("mesh.scanSeconds", 2);
+$("scan-seconds").parentElement.querySelector("b span").textContent = (+$("scan-seconds").value).toFixed(1);
+$("scan-seconds").oninput = (e) => {
+  e.target.parentElement.querySelector("b span").textContent = (+e.target.value).toFixed(1);
+  store.set("mesh.scanSeconds", +e.target.value);
+};
+$("scan-run").onclick = () => {
+  if (!hello || hello.replay || socket?.readyState !== WebSocket.OPEN || scanUI.busy || flat.running || surface.building) return;
+  scanUI.busy = true;
+  scanUI.requested = null;
+  $("scan-run").disabled = true;
+  renderFlatSources();
+  send({ cmd: "scan", seconds: +$("scan-seconds").value, leg: $("sam-auto-leg").value,
+    params: meshParams(), unfold: { method: flat.method, iterations: +$("flat-iters").value } });
+};
+function onScan(msg) {
+  scanUI.busy = ["capturing", "meshing", "unfolding"].includes(msg.state);
+  $("scan-run").disabled = scanUI.busy;
+  $("scan-run").textContent = { capturing: "CAPTURING…", meshing: "MESHING…", unfolding: "UNFOLDING…" }[msg.state] ?? "SCAN + UNFOLD";
+  $("scan-run").classList.toggle("busy", scanUI.busy);
+  $("scan-msg").className = `rig-msg ${msg.state === "done" ? "ok" : msg.state === "failed" || msg.state === "error" ? "err" : ""}`;
+  $("scan-msg").textContent = msg.message + (msg.warnings?.length ? ` ${msg.warnings.join(" ")}` : "");
+  $("mesh-state").textContent = { capturing: "CAPTURING", meshing: "MESHING", unfolding: "UNFOLDING", done: "LIVE MESH", partial: "MESH SAVED", failed: "SCAN FAILED" }[msg.state] ?? "—";
+  renderFlatSources();
+  if (msg.stem) {
+    scanUI.result = msg;
+    $("scan-view").disabled = false;
+    const requested = `${msg.recording}/${msg.stem}/${msg.flat_stem ?? ""}`;
+    if (scanUI.requested !== requested) {
+      scanUI.requested = requested;
+      // Serialize mesh-ready and flat-ready downloads so an older result cannot replace the new one.
+      scanUI.display = scanUI.display.catch(() => {}).then(() => showLiveScan(msg)).catch(scanDisplayError);
+    }
+  }
+}
+function scanDisplayError(e) {
+  $("scan-msg").className = "rig-msg err";
+  $("scan-msg").textContent = `Results are saved, but could not display the live overlay: ${e.message}`;
+}
+async function showLiveScan(result) {
+  if (!result || !hello || hello.replay) return;
+  const epoch = scanUI.epoch;
+  const current = () => epoch === scanUI.epoch && !hello?.replay && sameKey(scanUI.result, result);
+  if (scanCameraKey(result.cameras) !== scanCameraKey(hello.cameras)) {
+    throw new Error("Camera reference or calibration changed; scan again for a matching overlay.");
+  }
+  if (!sameKey(surface.id, result)) {
+    const [side, bin] = await Promise.all([fetch(meshUrl(result, "json")), fetch(meshUrl(result, "bin"))]);
+    if (!side.ok || !bin.ok) throw new Error("Mesh files missing.");
+    const [entry, data] = await Promise.all([side.json(), bin.arrayBuffer()]);
+    if (!current()) return;
+    if (!sameKey(flat.entry?.source, result)) closeFlat();
+    $("mesh-show").checked = true;
+    $("mesh-hide-cloud").checked = false;
+    showSurface({ recording: result.recording, stem: result.stem }, entry, data, { focus: false });
+    $("flat-source").value = `${result.recording}/${result.stem}`;
+  }
+  if (result.flat_stem && current()) {
+    await loadFlat({ recording: result.recording, stem: result.flat_stem }, current);
+  }
+}
+$("scan-view").onclick = () => {
+  scanUI.display = scanUI.display.catch(() => {}).then(() => showLiveScan(scanUI.result)).catch(scanDisplayError);
+};
+
 const surfaceMats = {
   rgb: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0, side: THREE.DoubleSide }),
   normal: new THREE.MeshNormalMaterial({ side: THREE.DoubleSide }),
@@ -1519,7 +1831,7 @@ const surfaceMats = {
 };
 
 // key = { recording, stem } of the saved files; entry = its sidecar (stats + where it came from).
-function showSurface(key, entry, buf) {
+function showSurface(key, entry, buf, { focus = true } = {}) {
   const stats = entry.stats;
   clearSurface();
   const dv = new DataView(buf);
@@ -1558,7 +1870,7 @@ function showSurface(key, entry, buf) {
   renderLibrary();
   $("mesh-result").hidden = false;
   applyVisibility();
-  focusSurface();
+  if (focus) focusSurface();
 }
 
 function focusSurface() {
@@ -1614,8 +1926,17 @@ function renderSurfaceStats(s, entry) {
   ];
   if (s.align) cells.push(["ALIGNMENT", `${s.align.aligned} frames snapped · fit ${s.align.rms_before_mm} → ${s.align.rms_after_mm} mm` +
     (s.align.failed ? ` · ${s.align.failed} kept as recorded` : ""), "wide"]);
-  if (s.section) cells.push(["SECTION", `${s.section.mode === "above" ? "ABOVE" : "BELOW"} KNEE · knee from ` +
-    `${s.section.knees_used} of ${s.section.knees_seen} detections · shift ${s.section.shift_cm >= 0 ? "+" : ""}${s.section.shift_cm} cm (gold ring)`, "wide"]);
+  const shift = s.section ? `shift ${s.section.shift_cm >= 0 ? "+" : ""}${s.section.shift_cm} cm (gold ring)` : "";
+  if (s.section?.mode === "knee") cells.push(["SECTION", `CUT AT KNEE CLICK · kept the + LEG side · ${shift}` +
+    (s.section.hip ? " · cut at the HIP" : " · not cut at the hip") +
+    (s.section.tube ? ` · thigh tube ${s.section.tube.radius_cm[0]}–${s.section.tube.radius_cm[1]} cm (dropped ${Math.round(s.section.tube.removed * 100)} %)` : ""), "wide"]);
+  else if (s.section) cells.push(["SECTION", `${s.section.mode === "above" ? "ABOVE" : "BELOW"} KNEE · knee from ` +
+    `${s.section.knees_used} of ${s.section.knees_seen} detections · ${shift}`, "wide"]);
+  if (s.segmentation?.box) cells.push(["BOX", `kept what's inside CAM ${s.segmentation.box.cameras.map((c) => c + 1).join(" + ")}'s box ` +
+    `(dropped ${Math.round(s.segmentation.box.removed * 100)} %)`, "wide"]);
+  if (s.segmentation) cells.push(["LEG MASK", `SAM 2 · ${s.auto ? "AUTO prompts" : "clicks"} on frame ${s.segmentation.frame + 1} · ` +
+    Object.entries(s.segmentation.cameras).map(([cam, v]) =>
+      `CAM ${+cam + 1} ${!v.source ? "none" : v.source === "clicks" ? "clicked" : `from ${v.source}`}`).join(" · "), "wide"]);
   if (s.holes) cells.push(["HOLES", s.holes.holes_found
     ? `filled ${s.holes.holes_filled} of ${s.holes.holes_found}` + (s.holes.holes_filled ? ` (largest ${s.holes.largest_filled_cm} cm)` : "")
     : "none found", "wide"]);
@@ -1790,7 +2111,7 @@ document.querySelectorAll("#saved-scope button").forEach((b) => (b.onclick = () 
 }));
 
 // ───────────────────────────── flatten mesh ─────────────────────────────
-// A saved surface mesh is unrolled server-side (POST /api/surface/flatten, SCAF or ARAP) and
+// A saved surface mesh is unrolled server-side (POST /api/surface/flatten, SCAF, SLIM or ARAP) and
 // saved next to it. The flat view draws the sheet in its own small renderer (x, y in metres)
 // and fetches one binary blob (flatten.flat_binary): u32 V, u32 F, f32 uv[V*2], f32 xyz[V*3]
 // (world), u8 rgb (padded), u32 faces, f32 stretch[F], u8 kind[F] (padded; 1 = hole patch).
@@ -1998,14 +2319,16 @@ flatCanvas.addEventListener("wheel", (ev) => {
   drawFlat();
 }, { passive: false });
 
-async function loadFlat(key) {
+async function loadFlat(key, current = () => true) {
   const [side, bin] = await Promise.all([fetch(meshUrl(key, "json")), fetch(meshUrl(key, "flat"))]);
   if (!side.ok || !bin.ok) throw new Error("flat mesh files missing");
   const entry = await side.json();
+  const data = parseFlat(await bin.arrayBuffer());
+  if (!current()) return;
   closeFlat();
   flat.key = { recording: key.recording, stem: key.stem };
   flat.entry = entry;
-  flat.data = parseFlat(await bin.arrayBuffer());
+  flat.data = data;
   flat.mesh = buildFlatMesh(flat.data);
   flatScene.add(flat.mesh);
   $("flat-result").hidden = false;
@@ -2071,7 +2394,7 @@ function renderFlatSources() {
   for (const v of [keep, shown, here && `${here.recording}/${here.stem}`]) {
     if (v && [...sel.options].some((o) => o.value === v)) { sel.value = v; break; }
   }
-  $("flat-run").disabled = flat.running || !sel.value;
+  $("flat-run").disabled = flat.running || scanUI.busy || !sel.value;
   $("flat-run").title = sel.value ? "Unroll the selected mesh" : "Pick a saved mesh first";
 }
 const flatSourceKey = () => {
@@ -2082,6 +2405,10 @@ const flatSourceKey = () => {
 // Show the flat mesh's source surface in 3D (opens its recording at that frame if needed).
 function showFlatSource(src) {
   if (!src || sameKey(surface.id, src)) return;
+  if (!hello?.replay && sameKey(scanUI.result, src)) {
+    showLiveScan({ ...scanUI.result, flat_stem: null }).catch(scanDisplayError);
+    return;
+  }
   const item = library.items.find((e) => sameKey(e, src));
   if (item) openSaved(item);
 }
@@ -2096,7 +2423,7 @@ function onFlatProgress(msg) {
 
 $("flat-run").onclick = async () => {
   const src = flatSourceKey();
-  if (flat.running || !src) return;
+  if (flat.running || scanUI.busy || !src) return;
   flat.running = true;
   const btn = $("flat-run");
   btn.textContent = "FLATTENING…"; btn.classList.add("busy"); btn.disabled = true;

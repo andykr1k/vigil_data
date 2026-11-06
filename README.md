@@ -123,10 +123,56 @@ Every build is saved to `Meshes/<recording>/frame<N>_t<seconds>s_tsdf_<created>.
 clicking one replays its recording paused at that frame with the mesh shown, and gold marks
 under the replay slider jump to them. Meshes are in the world frame (metres), like `cloud/*.ply`.
 
+### SAM 2 THIGH: the thigh without the recorded pose (AUTO, clicks, BOX)
+
+The third **LEG REGION**, **SAM 2 THIGH**, finds the leg in the colour images instead of from the
+recorded joints. It always meshes the thigh, knee → hip; POSE CAPSULE and DEPTH WINDOW are
+unchanged.
+
+- **AUTO** places the clicks on the replayed frame. Two Sapiens2 models (Meta; `facebook/sapiens2-seg-0.4b`
+  and `-pose-0.4b`, about 1.6 GB each, downloaded on first use) label body parts and keypoints in each
+  camera. The knee is where thigh meets shin, or the knee keypoint. The hip is where the thigh meets the
+  torso (at least 150 px and 20 cm from the knee; a shorts hem doesn't count), or the hip keypoint. Every
+  camera votes over 5 frames in ±0.3 s, along the leg. AUTO refuses the frame, with the reason, when a camera
+  jumps around (> 2.5 cm), the cameras disagree (> 8 cm along the leg) or they're on different legs. The
+  menu next to it picks the LEFT or RIGHT leg; EITHER picks the one the cameras see best.
+- **Clicks**, on a camera feed: **+ LEG** on the thigh, **− NOT** on anything that isn't, **KNEE**, and
+  optionally **HIP**. One camera is enough: the others get + prompts through depth (hollow circles).
+- **BOX**: drag a rectangle around the thigh in a camera feed. SAM 2 gets it as a box prompt and the
+  mesh keeps only what projects inside it from that camera (a 3D crop, so it limits every camera). Draw it
+  tight around the thigh, or add one + LEG click: a loose box around the whole leg is ambiguous for SAM 2.
+  A box alone builds with no knee cut (the box edges are the cuts).
+- **BUILD MESH** with no clicks runs AUTO first.
+
+SAM 2 (`facebook/sam2.1-hiera-small`, about 180 MB) tracks the leg from the clicked frame through the
+window in each camera. The mesh is then cut across the leg at the KNEE click (KNEE SHIFT moves it) and
+at the HIP click. **Thigh tube** (on by default) also keeps only a tube around the thigh, measured just above
+the knee and widening toward the hip: SAM 2 segments objects, so shorts come out whole (both thighs, the
+buttock). The mesh JSON adds `stats.segmentation` (prompts, per-camera mask steadiness, the box) and
+`stats.section.hip` / `.tube`. Code: `meshing/legmask.py` (SAM 2), `meshing/autoleg.py` (AUTO); endpoints
+`POST /api/surface/leg-mask` and `/api/surface/auto-prompts`. Needs transformers ≥ 5.20.2 (for Sapiens2).
+
+**Live: SCAN + UNFOLD** (in MESH METHODS, `testing.mode: 0`). Captures for LENGTH (default 2 s), then
+runs the existing AUTO/SAM 2/cuts/TSDF pipeline using the selected mesh settings. AUTO supplies the
+thigh region and knee/hip prompts; WINDOW is limited to fit the capture. The 3D mesh appears directly
+over the live point cloud without opening replay or changing the viewpoint. The selected unfolding
+method and iterations then produce the linked 2D view. Hold the leg still: the overlay stays at its
+captured world position and does not track subsequent leg movement. Capture and both results are saved.
+If unfolding fails, the 3D mesh remains available for a FLATTEN retry. Startup checks are unchanged;
+`testing.mode: 1` retains the recording/replay testing workflow. See [the pipeline file guide](docs/mesh-pipeline.md)
+for the implementation and review order.
+
+**`vigil auto [recordings…]`** does the same over saved recordings (default: the recording dir). It scores
+candidate frames (leg in view, depth, stillness), tries the best, and checks before building (SAM 2 keeps the
++ points, avoids the − points, doesn't spill onto the support) and after (steady mask, support cut, knee cut
+on the leg, plausible area). Options: `--leg`, `--count`, `--attempts`, `--window`, `--stride`,
+`--model-size`, `--meshes`. It writes `Meshes/auto_reports/<run>/report.{json,csv}` and previews.
+Code: `meshing/auto.py`.
+
 ## Flatten mesh (unroll a saved surface)
 
 The **FLATTEN MESH** panel unrolls a saved surface onto the plane. Pick the mesh, choose
-**SCAF** (Jiang 2017) or **ARAP** (Liu 2008), and press **FLATTEN**. No replay is needed,
+**SCAF** (Jiang 2017), **SLIM** (Rabinovich 2017) or **ARAP** (Liu 2008), and press **FLATTEN**. No replay is needed,
 but the source surface is opened in 3D so points can be shown on it. Code:
 `src/vigil/meshing/flatten.py`; the optimisation is the authors' libigl code in
 `src/vigil/meshing/native/` (sources and licences in `SOURCES.md`). It is built with CMake on
@@ -142,7 +188,7 @@ the first FLATTEN, which needs CMake, a C++17 compiler and Eigen3 (`apt install 
   MAX HOLE don't remove them; rebuilding with a larger TRUNC (e.g. 20 mm) or VOXEL (4 mm) usually does.
   Nothing is saved and the other method is never substituted.
 
-Each result is saved next to its source: `Meshes/<recording>/frame<N>_t<seconds>s_flat-<scaf|arap>_<created>.{ply,json,jpg,npz}`.
+Each result is saved next to its source: `Meshes/<recording>/frame<N>_t<seconds>s_flat-<scaf|slim|arap>_<created>.{ply,json,jpg,npz}`.
 The `.ply` is the flat sheet (x, y in metres, z = 0), the `.npz` the full flat ↔ 3D correspondence,
 and the `.json` names the source mesh and holds the stretch statistics. It is listed in
 **SAVED MESHES** with a FLAT tag.
@@ -185,7 +231,8 @@ src/vigil/
   recorder.py             session recording (PLY clouds, RGB-D, meta, per-frame JSONL)
   replay.py               replays a recording through the dashboard protocol
   meshing/                MESH METHODS: leg-surface meshes from replays (tsdf.py, holes.py,
-                          flatten.py + native/ = FLATTEN MESH (SCAF / ARAP),
+                          legmask.py = SAM 2, autoleg.py = AUTO, auto.py = vigil auto / SCAN THIGH,
+                          flatten.py + native/ = FLATTEN MESH (SCAF / SLIM / ARAP),
                           library.py = the Meshes/ folder, routes.py = /api/surface/*)
   startup.py              startup checklist, progress and time left for the dashboard
   body.py                 body thread: subject tracking, batched pose, triangulation, smoothing

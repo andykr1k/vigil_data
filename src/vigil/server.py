@@ -108,6 +108,8 @@ def create_app(cfg: Config) -> FastAPI:
         if pipeline.hello:
             client.offer((json.dumps(pipeline.hello), []), droppable=False)
         client.offer((json.dumps(pipeline.status), []), droppable=False)
+        if pipeline.scan_status:
+            client.offer((json.dumps(pipeline.scan_status), []), droppable=False)
         hub.clients.add(client)
 
         async def receive() -> None:

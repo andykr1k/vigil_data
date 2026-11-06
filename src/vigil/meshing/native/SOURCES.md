@@ -6,7 +6,7 @@ test_legs viewer, where these methods were compared).
 
 - **libigl 2.5.0**, commit `fdaac01bcc52888994f7afd029dcc045dd408484`:
   <https://github.com/libigl/libigl/tree/v2.5.0>. Only the transitive header/source
-  dependencies of ARAP and SCAF are needed. License: `vendor/libigl/LICENSE.MPL2`.
+  dependencies of ARAP, SCAF and SLIM are needed. License: `vendor/libigl/LICENSE.MPL2`.
 - **Triangle**, commit `62f02db9ab4ff4b62d5ff82a77c8ea458c84c23a`:
   <https://github.com/libigl/triangle>. Original notices and redistribution terms
   are in `vendor/triangle/README` and the source headers.
@@ -24,6 +24,12 @@ test_legs viewer, where these methods were compared).
   initialisation. Inputs are normalised to unit surface area for libigl's
   energy-minus-four convention and UVs are then restored to metres. Iteration stops
   at energy below `1e-12` to avoid a negative scaffold weight from round-off at isometry.
+- **SLIM**: Rabinovich et al., *Scalable Locally Injective Mappings* (2017).
+  <https://igl.ethz.ch/projects/slim/>. Calls the authors' libigl `slim_precompute`
+  and `slim_solve`, with symmetric Dirichlet energy, no soft constraints, a free
+  boundary, and the same area-matched harmonic initialisation as SCAF. The reference
+  weighted local/global solver and flip-avoiding line search are unchanged. Local
+  injectivity alone does not rule out distant boundary overlaps; `../flatten.py` checks them.
 
 Built automatically on the first FLATTEN (CMake, a C++17 compiler and Eigen3 required):
 

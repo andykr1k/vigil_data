@@ -1,7 +1,8 @@
-// FLATTEN MESH: SCAF and ARAP from the unmodified libigl reference implementations.
+// FLATTEN MESH: SCAF, SLIM and ARAP from the unmodified libigl reference implementations.
 // Algorithms and licences are recorded in SOURCES.md. Called by ../flatten.py:
-//   planar_solver <scaf|arap> <mesh.txt> <uv.txt> <iterations>
+//   planar_solver <scaf|slim|arap> <mesh.txt> <uv.txt> <iterations>
 #include <igl/triangle/scaf.h>
+#include <igl/slim.h>
 #include <igl/arap.h>
 #include <igl/boundary_loop.h>
 #include <igl/doublearea.h>
@@ -73,6 +74,16 @@ int main(int argc, char **argv) {
         // Stop before round-off can make that nonnegative weight negative.
         if (data.energy < 1e-12) break;
       }
+    } else if (method == "slim") {
+      igl::SLIMData data;
+      igl::slim_precompute(V, F, uv, data,
+          igl::MappingEnergyType::SYMMETRIC_DIRICHLET, pinned, targets, 0);
+      for (int i = 0; i < iterations; ++i) {
+        uv = igl::slim_solve(data, 1);
+        if (!uv.allFinite()) throw std::runtime_error("SLIM produced non-finite coordinates.");
+        std::cout << "PROGRESS " << i + 1 << ' ' << std::setprecision(17)
+                  << data.energy << std::endl;
+      }
     } else if (method == "arap") {
       igl::ARAPData data;
       // Optimize the paper's static ARAP energy. A single vertex removes only
@@ -87,7 +98,7 @@ int main(int argc, char **argv) {
       if (!igl::arap_solve(anchor_uv, data, uv)) throw std::runtime_error("ARAP solve failed.");
       std::cout << "PROGRESS " << iterations << " 0" << std::endl;
     } else {
-      throw std::runtime_error("Unknown method (expected scaf or arap).");
+      throw std::runtime_error("Unknown method (expected scaf, slim or arap).");
     }
     std::ofstream output(argv[3]);
     uv *= source_scale;

@@ -8,7 +8,7 @@
         frame00600_t0021.88s_tsdf_20261002-143012.json  recording, frame, seq, time, window, settings, stats
         frame00600_t0021.88s_tsdf_20261002-143012.jpg   camera 1 at that frame (thumbnail)
         frame00600_t0021.88s_flat-scaf_20261008-101500-123456.{ply,json,jpg,npz}
-                                                FLATTEN MESH: that surface unrolled (SCAF / ARAP);
+                                                FLATTEN MESH: that surface unrolled (SCAF / SLIM / ARAP);
                                                 the .npz maps every flat point back onto it
 
 `frame` is the frame number the viewer shows (1-based, "FRAME 600 / 1317"); `index` in the
@@ -57,7 +57,7 @@ Coordinates: the recording's world frame (camera 1 colour optical frame: x right
 z forward), metres -- the same frame as the recording's cloud/*.ply and frames.jsonl.
 
 Flattened meshes (FLATTEN MESH) sit next to the surface they came from, named
-frameNNNNN_tSSSS.SSs_flat-<scaf|arap>_<created>. Their .ply is the flat sheet (x, y in metres,
+frameNNNNN_tSSSS.SSs_flat-<scaf|slim|arap>_<created>. Their .ply is the flat sheet (x, y in metres,
 z = 0); the .npz holds the full correspondence (uv, the 3D vertices and triangles, per-triangle
 stretch); the .json names the source mesh and holds the distortion stats.
 

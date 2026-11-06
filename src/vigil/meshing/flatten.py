@@ -1,4 +1,4 @@
-"""FLATTEN MESH: unroll a saved leg-surface mesh onto the plane (SCAF or ARAP).
+"""FLATTEN MESH: unroll a saved leg-surface mesh onto the plane (SCAF, SLIM or ARAP).
 
 The surface is an open sheet (a disk), so it's mapped straight to the plane: no cuts and no
 completion into a tube. The optimisation itself is done by the authors' libigl code, in
@@ -7,7 +7,7 @@ This module prepares the sheet (drops debris, splits pinched vertices, orients i
 small holes), runs the solver, checks what comes back, and keeps the correspondence: every
 flat point maps to a point on the 3D surface through the same triangle.
 
-Ported from the test_legs viewer (planar.py + unwrap.py), SCAF and ARAP only.
+Ported from the test_legs viewer (planar.py + unwrap.py), SCAF, SLIM and ARAP only.
 """
 
 from __future__ import annotations
@@ -29,6 +29,9 @@ METHODS = {
     "scaf": {"title": "SCAF · Jiang 2017", "metric": "symmetric_dirichlet",
              "paper": "https://cims.nyu.edu/gcl/papers/Scaffold-2017.pdf",
              "implementation": "libigl 2.5.0 / igl::triangle::scaf_solve"},
+    "slim": {"title": "SLIM · Rabinovich 2017", "metric": "symmetric_dirichlet",
+             "paper": "https://igl.ethz.ch/projects/slim/",
+             "implementation": "libigl 2.5.0 / igl::slim_solve (symmetric Dirichlet)"},
     "arap": {"title": "ARAP · Liu 2008", "metric": "as_rigid_as_possible",
              "paper": "https://cs.harvard.edu/~sjg/papers/arap.pdf",
              "implementation": "libigl 2.5.0 / igl::arap_solve (2D, element energy)"},
@@ -311,11 +314,11 @@ def _solve(v, f, method, iterations, progress):
             uv = np.loadtxt(result, ndmin=2)
         if count != len(v) or uv.shape != (len(v), 2):
             raise MeshError("The solver returned a different number of vertices.")
-    return uv, {"iterations": len(history) if method == "scaf" else iterations, "iteration_limit": iterations,
+    return uv, {"iterations": len(history) if method in ("scaf", "slim") else iterations, "iteration_limit": iterations,
                 "solver": method, "implementation": METHODS[method]["implementation"],
                 "paper": METHODS[method]["paper"], "metric": METHODS[method]["metric"],
                 "boundary_fixed": False, "translation_anchor_vertex": 0 if method == "arap" else None,
-                "energy_history": history if method == "scaf" else []}
+                "energy_history": history if method in ("scaf", "slim") else []}
 
 
 # ---------------------------------------------------------------------- entry point
@@ -325,7 +328,7 @@ def flatten_mesh(mesh: Mesh, method: str = "scaf", iterations: int = 50, progres
     progress = progress or (lambda stage, fraction: None)
     started = time.monotonic()
     if method not in METHODS:
-        raise MeshError(f"Unknown flattening method {method!r} (SCAF or ARAP).")
+        raise MeshError(f"Unknown flattening method {method!r} (SCAF, SLIM or ARAP).")
     if mesh.stats.get("method") == "flat":
         raise MeshError("This mesh is already flat. Pick the surface mesh it came from.")
     try:

@@ -1,4 +1,4 @@
-"""`vigil` command line: run the dashboard, fetch models, check the camera."""
+"""`vigil` command line: run the dashboard, fetch models, check the camera, mesh recordings."""
 
 from __future__ import annotations
 
@@ -140,7 +140,25 @@ def cmd_camera(args: argparse.Namespace) -> None:
               f"median {np.median(d[d > 0]):.2f} m")
 
 
+def cmd_auto(args: argparse.Namespace) -> None:
+    """Thigh meshes from recordings without clicks (meshing/auto.py)."""
+    from pathlib import Path
+
+    from .meshing.auto import recordings_in, run_batch
+
+    cfg = load_config(args.config)
+    recordings = cfg.resolve(cfg.recording.dir)
+    recs = recordings_in(args.recordings or [recordings])
+    if not recs:
+        sys.exit("vigil auto: no recordings found (folders with a meta.json)")
+    meshes = (args.meshes or recordings.parent / "Meshes").resolve()  # as the dashboard's (meshing/routes.py)
+    run_batch(recs, Path(meshes), side=args.leg, count=args.count, attempts=args.attempts, window_s=args.window,
+              stride_s=args.stride, size=args.model_size, say=lambda line: print(line, flush=True))
+
+
 def main() -> None:
+    from pathlib import Path
+
     parser = argparse.ArgumentParser(prog="vigil", description="RealSense leg pose dashboard")
     parser.add_argument("-c", "--config", help="YAML config (default: configs/default.yaml)")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -153,6 +171,20 @@ def main() -> None:
 
     sub.add_parser("setup", help="fetch SAM 3D Body code + all model weights").set_defaults(func=cmd_setup)
     sub.add_parser("camera", help="list and check the RealSense cameras").set_defaults(func=cmd_camera)
+
+    auto = sub.add_parser("auto", help="thigh meshes from recordings without clicks (Sapiens2 + SAM 2 + TSDF)")
+    auto.add_argument("recordings", nargs="*", type=Path,
+                      help="recording folders, or folders of recordings (default: the recording dir in the config)")
+    auto.add_argument("--leg", choices=("auto", "left", "right"), default="auto",
+                      help="the subject's leg to mesh (default: auto, the leg resting on the support)")
+    auto.add_argument("--count", type=int, default=1, help="meshes per recording (default: 1)")
+    auto.add_argument("--attempts", type=int, default=5, help="frames to try per recording (default: 5)")
+    auto.add_argument("--window", type=float, default=0.5, help="± seconds of depth to fuse (default: 0.5)")
+    auto.add_argument("--stride", type=float, default=1.0, help="seconds between candidate frames (default: 1)")
+    auto.add_argument("--model-size", default="0.4b", choices=("0.4b", "0.8b", "1b", "5b"),
+                      help="Sapiens2 size (default: 0.4b; larger is slower and downloads more)")
+    auto.add_argument("--meshes", type=Path, help="mesh library (default: Meshes next to the recording dir)")
+    auto.set_defaults(func=cmd_auto)
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
